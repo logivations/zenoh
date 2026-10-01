@@ -1157,9 +1157,10 @@ pub(crate) fn register_expr_interest(
 mod literal_child_tests {
     use std::collections::BTreeSet;
 
+    use zenoh_protocol::core::WhatAmI;
+
     use super::*;
     use crate::net::{primitives::DummyPrimitives, routing::gateway::GatewayBuilder};
-    use zenoh_protocol::core::WhatAmI;
 
     std::thread_local! {
         pub(super) static LAST_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };

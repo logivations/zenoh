@@ -24,10 +24,9 @@ use zenoh_protocol::{
 };
 
 use super::{try_init_tracing_subscriber, Connection, FaceDef, Harness, HarnessBuilder};
-use crate::net::{primitives::Primitives, routing::hat::peer::INITIAL_INTEREST_ID};
-
 #[cfg(debug_assertions)]
 use crate::net::routing::dispatcher::interests::REMOTE_INTEREST_SCAN_COUNT;
+use crate::net::{primitives::Primitives, routing::hat::peer::INITIAL_INTEREST_ID};
 
 /// Test that current tokens are re-propagated even if they've already been propagated in future
 /// mode.
