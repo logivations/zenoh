@@ -545,13 +545,21 @@ impl Resource {
                 // consider only childless resource held by only one external object (+ 1 strong count for resclone, + 1 strong count for res.parent to a total of 3 )
                 tracing::debug!("Unregister resource {}", res.expr());
                 if let Some(context) = mutres.ctx.as_mut() {
+                    let res_ptr = Arc::as_ptr(res);
                     for match_ in &mut context.matches {
                         let mut match_ = match_.upgrade().unwrap();
                         if !Arc::ptr_eq(&match_, res) {
                             let mutmatch = get_mut_unchecked(&mut match_);
                             if let Some(ctx) = mutmatch.ctx.as_mut() {
-                                ctx.matches
-                                    .retain(|x| !Arc::ptr_eq(&x.upgrade().unwrap(), res));
+                                ctx.matches.retain(|x| {
+                                    // Keep the live-match invariant without acquiring
+                                    // a temporary strong owner just to compare identity.
+                                    assert!(
+                                        x.strong_count() != 0,
+                                        "expired resource in match list"
+                                    );
+                                    x.as_ptr() != res_ptr
+                                });
                             }
                         }
                     }
@@ -1222,6 +1230,28 @@ mod literal_child_tests {
         for query in queries {
             assert_query_matches(&tables.data, keyexpr::new(query).unwrap());
         }
+        let mut pending = vec![&tables.data.root_res];
+        while let Some(resource) = pending.pop() {
+            if let Some(ctx) = &resource.ctx {
+                if let Ok(key) = keyexpr::new(resource.expr()) {
+                    let mut actual = ctx
+                        .matches
+                        .iter()
+                        .map(|m| {
+                            assert!(m.strong_count() != 0);
+                            m.as_ptr()
+                        })
+                        .collect::<Vec<_>>();
+                    actual.sort_unstable();
+                    assert_eq!(
+                        actual,
+                        intersecting_resources(&tables.data.root_res, key),
+                        "cached match identities differ for {key}",
+                    );
+                }
+            }
+            pending.extend(resource.children.iter().map(|child| &child.0));
+        }
     }
 
     // Includes the upstream matching corpus, namespace prefixes, verbatim
@@ -1366,6 +1396,39 @@ mod literal_child_tests {
         }
         assert_queries_match_intersection(&tables, &queries);
         assert!(zread!(tables.tables).data.root_res.children.is_empty());
+    }
+
+    #[test]
+    fn clean_rejects_expired_reverse_match() {
+        let router = new_router();
+        let tables = router.tables.clone();
+        let mut face = router
+            .new_session(Arc::new(DummyPrimitives {}))
+            .state
+            .clone();
+        register_expr(&tables, &mut face, 1, &"kept/**".into());
+        register_expr(&tables, &mut face, 2, &"kept/leaf".into());
+        {
+            let tables = zwrite!(tables.tables);
+            let mut wildcard = Resource::get_resource(&tables.data.root_res, "kept/**").unwrap();
+            let expired = {
+                let resource = Resource::root();
+                Arc::downgrade(&resource)
+            };
+            assert!(expired.upgrade().is_none());
+            get_mut_unchecked(&mut wildcard)
+                .context_mut()
+                .matches
+                .push(expired);
+        }
+        // The leaf's own list contains only live matches. The expired entry is
+        // encountered specifically while removing it from the wildcard's list.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unregister_expr(&tables, &mut face, 2);
+        }));
+        let mut tables = tables.tables.write().unwrap_or_else(|e| e.into_inner());
+        tables.data.root_res.close();
+        assert!(result.is_err(), "cleanup accepted an expired reverse match");
     }
 
     #[test]
