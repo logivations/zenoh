@@ -26,7 +26,7 @@ use zenoh_sync::get_mut_unchecked;
 use super::Hat;
 use crate::net::routing::{
     dispatcher::{
-        face::InterestState,
+        face::{FaceId, InterestState},
         interests::{
             CurrentInterest, CurrentInterestCleanup, PendingCurrentInterest, RemoteInterest,
         },
@@ -169,48 +169,13 @@ impl HatInterestTrait for Hat {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(ctx, _msg), ret)]
-    fn route_interest_final(
-        &mut self,
-        ctx: DispatcherContext,
-        _msg: &Interest,
-        remote_interest: &RemoteInterest,
-    ) {
+    #[tracing::instrument(level = "debug", skip(tables), ret)]
+    fn interest_final_destination(&self, tables: &TablesData) -> Option<FaceId> {
         debug_assert!(self.region().bound().is_north());
-        debug_assert!(ctx.src_face.region.bound().is_south());
 
         // NOTE(regions): clients have at most one north-bound remote, this invariant is enforced in
         // the orchestrator.
-        if let Some(dst_face) = self
-            .owned_faces_mut(ctx.tables)
-            .next()
-            .map(get_mut_unchecked)
-        {
-            dst_face.local_interests.retain(|id, local_interest| {
-                if local_interest == remote_interest {
-                    dst_face.primitives.send_interest(RoutingContext::with_expr(
-                        &mut Interest {
-                            id: *id,
-                            mode: InterestMode::Final,
-                            // NOTE: InterestMode::Final options are undefined in the current protocol specification,
-                            // they are initialized here for internal use by local egress interceptors.
-                            options: remote_interest.options,
-                            wire_expr: None,
-                            ext_qos: interest::ext::QoSType::INTEREST,
-                            ext_tstamp: None,
-                            ext_nodeid: interest::ext::NodeIdType::DEFAULT,
-                        },
-                        local_interest
-                            .res
-                            .as_ref()
-                            .map(|res| res.expr().to_string())
-                            .unwrap_or_default(),
-                    ));
-                    return false;
-                }
-                true
-            });
-        }
+        self.owned_faces(tables).next().map(|face| face.id)
     }
 
     #[tracing::instrument(level = "debug", skip(ctx), ret)]
@@ -340,6 +305,10 @@ impl HatInterestTrait for Hat {
         _msg: &Interest,
     ) -> Option<RemoteInterest> {
         unreachable!("south-bound client hat");
+    }
+
+    fn has_remote_interest(&self, _tables: &TablesData, _interest: &RemoteInterest) -> bool {
+        unreachable!("south-bound client hat")
     }
 
     #[tracing::instrument(level = "trace", skip(_tables), ret)]

@@ -25,7 +25,7 @@ use zenoh_protocol::{
     core::Region,
     network::{
         declare::{self},
-        interest::{InterestId, InterestMode, InterestOptions},
+        interest::{self, InterestId, InterestMode, InterestOptions},
         Declare, DeclareBody, DeclareFinal, Interest,
     },
 };
@@ -39,6 +39,12 @@ use crate::net::routing::{
     hat::{DispatcherContext, Remote, RouteCurrentDeclareResult, RouteInterestResult, SendDeclare},
     RoutingContext,
 };
+
+// Keep work-bound checks out of release test binaries as well as production builds.
+#[cfg(all(test, debug_assertions))]
+thread_local! {
+    pub(crate) static REMOTE_INTEREST_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct CurrentInterest {
@@ -369,7 +375,39 @@ impl Face {
             return;
         };
 
-        hats[Region::North].route_interest_final(ctx, msg, &remote_interest);
+        debug_assert!(ctx.src_face.region.bound().is_south());
+        let Some(destination) = hats[Region::North].interest_final_destination(ctx.tables) else {
+            return;
+        };
+        if hats[region].has_remote_interest(ctx.tables, &remote_interest) {
+            return;
+        }
+
+        let dst_face = get_mut_unchecked(ctx.tables.faces.get_mut(&destination).unwrap());
+        dst_face.local_interests.retain(|id, local_interest| {
+            if local_interest == &remote_interest {
+                dst_face.primitives.send_interest(RoutingContext::with_expr(
+                    &mut Interest {
+                        id: *id,
+                        mode: InterestMode::Final,
+                        // NOTE: InterestMode::Final options are undefined in the current protocol specification,
+                        // they are initialized here for internal use by local egress interceptors.
+                        options: remote_interest.options,
+                        wire_expr: None,
+                        ext_qos: interest::ext::QoSType::INTEREST,
+                        ext_tstamp: None,
+                        ext_nodeid: interest::ext::NodeIdType::DEFAULT,
+                    },
+                    local_interest
+                        .res
+                        .as_ref()
+                        .map(|res| res.expr().to_string())
+                        .unwrap_or_default(),
+                ));
+                return false;
+            }
+            true
+        });
     }
 
     #[tracing::instrument(level = "debug", skip(self, wtables, _node_id, send_declare), ret)]

@@ -39,7 +39,7 @@ use zenoh_transport::unicast::TransportUnicast;
 
 use super::{
     dispatcher::{
-        face::FaceState,
+        face::{FaceId, FaceState},
         pubsub::SubscriberInfo,
         tables::{
             NodeId, QueryTargetQablSet, Resource, Route, RoutingExpr, TablesData, TablesLock,
@@ -349,8 +349,10 @@ pub(crate) enum RouteInterestResult {
 ///      iff it owns the src face and there is no gateway in the north region.
 ///
 /// # `Interest` w/ `mode=Final`
-///   1. [`HatInterestTrait::route_interest_final`] on the north hat.
-///   2. [`HatInterestTrait::unregister_interest`] on the owner south hat, iff it owns the src face.
+///   1. [`HatInterestTrait::unregister_interest`] on the owner south hat.
+///   2. [`HatInterestTrait::interest_final_destination`] on the north hat.
+///   3. [`HatInterestTrait::has_remote_interest`] on the owner south hat, if there is a destination.
+///   4. Finalize matching outgoing interests if no equal incoming interest remains.
 ///
 /// # `DeclareFinal` (final)
 ///   1. [`HatInterestTrait::route_declare_final`] on the north hat.
@@ -368,12 +370,8 @@ pub(crate) trait HatInterestTrait {
         src: &Remote,
     ) -> RouteInterestResult;
 
-    fn route_interest_final(
-        &mut self,
-        ctx: DispatcherContext,
-        msg: &Interest,
-        remote_interest: &RemoteInterest,
-    );
+    /// Select the existing north-bound destination for outgoing interest finalization.
+    fn interest_final_destination(&self, tables: &TablesData) -> Option<FaceId>;
 
     fn route_declare_final(
         &mut self,
@@ -428,11 +426,15 @@ pub(crate) trait HatInterestTrait {
         res: Option<Arc<Resource>>,
     );
 
+    /// Remove the owner's incoming interest and clean up its local entity registrations.
     fn unregister_interest(
         &mut self,
         ctx: DispatcherContext,
         msg: &Interest,
     ) -> Option<RemoteInterest>;
+
+    /// Whether an equal incoming interest remains in this hat's owned faces.
+    fn has_remote_interest(&self, tables: &TablesData, interest: &RemoteInterest) -> bool;
 
     fn remote_interests(&self, tables: &TablesData) -> HashSet<RemoteInterest>;
 }

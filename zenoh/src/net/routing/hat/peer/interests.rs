@@ -30,7 +30,7 @@ use zenoh_sync::get_mut_unchecked;
 use super::{initial_interest, Hat, INITIAL_INTEREST_ID};
 use crate::net::routing::{
     dispatcher::{
-        face::InterestState,
+        face::{FaceId, InterestState},
         interests::{
             CurrentInterest, CurrentInterestCleanup, PendingCurrentInterest, RemoteInterest,
         },
@@ -208,46 +208,13 @@ impl HatInterestTrait for Hat {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(ctx, _msg), ret)]
-    fn route_interest_final(
-        &mut self,
-        ctx: DispatcherContext,
-        _msg: &Interest,
-        remote_interest: &RemoteInterest,
-    ) {
+    #[tracing::instrument(level = "debug", skip(tables), ret)]
+    fn interest_final_destination(&self, tables: &TablesData) -> Option<FaceId> {
         debug_assert!(self.region().bound().is_north());
-        debug_assert!(ctx.src_face.region.bound().is_south());
 
-        if let Some(dst_face) = self
-            .owned_faces_mut(ctx.tables)
-            .find(|f| f.remote_bound.is_south())
-            .map(get_mut_unchecked)
-        {
-            dst_face.local_interests.retain(|id, local_interest| {
-                if local_interest == remote_interest {
-                    dst_face.primitives.send_interest(RoutingContext::with_expr(
-                        &mut Interest {
-                            id: *id,
-                            mode: InterestMode::Final,
-                            // NOTE: InterestMode::Final options are undefined in the current protocol specification,
-                            // they are initialized here for internal use by local egress interceptors.
-                            options: remote_interest.options,
-                            wire_expr: None,
-                            ext_qos: interest::ext::QoSType::INTEREST,
-                            ext_tstamp: None,
-                            ext_nodeid: interest::ext::NodeIdType::DEFAULT,
-                        },
-                        local_interest
-                            .res
-                            .as_ref()
-                            .map(|res| res.expr().to_string())
-                            .unwrap_or_default(),
-                    ));
-                    return false;
-                }
-                true
-            });
-        }
+        self.owned_faces(tables)
+            .find(|face| face.remote_bound.is_south())
+            .map(|face| face.id)
     }
 
     #[tracing::instrument(level = "debug", skip(ctx), ret)]
@@ -732,15 +699,21 @@ impl HatInterestTrait for Hat {
             }
         }
 
-        self.owned_faces(ctx.tables)
-            .all(|face| {
-                !self
-                    .face_hat(face)
-                    .remote_interests
-                    .values()
-                    .contains(&remote_interest)
-            })
-            .then_some(remote_interest)
+        Some(remote_interest)
+    }
+
+    #[tracing::instrument(level = "debug", skip(tables), ret)]
+    fn has_remote_interest(&self, tables: &TablesData, interest: &RemoteInterest) -> bool {
+        #[cfg(all(test, debug_assertions))]
+        crate::net::routing::dispatcher::interests::REMOTE_INTEREST_SCAN_COUNT
+            .with(|count| count.set(count.get() + 1));
+
+        self.owned_faces(tables).any(|face| {
+            self.face_hat(face)
+                .remote_interests
+                .values()
+                .contains(interest)
+        })
     }
 
     #[tracing::instrument(level = "trace", skip(tables), ret)]

@@ -23,6 +23,7 @@ use zenoh_protocol::network::{
 use super::Hat;
 use crate::net::routing::{
     dispatcher::{
+        face::FaceId,
         interests::{CurrentInterest, RemoteInterest},
         resource::Resource,
         tables::TablesData,
@@ -49,15 +50,10 @@ impl HatInterestTrait for Hat {
         RouteInterestResult::ResolvedCurrentInterest
     }
 
-    #[tracing::instrument(level = "debug", skip(ctx, _msg), ret)]
-    fn route_interest_final(
-        &mut self,
-        ctx: DispatcherContext,
-        _msg: &Interest,
-        _remote_interest: &RemoteInterest,
-    ) {
+    #[tracing::instrument(level = "debug", skip(_tables), ret)]
+    fn interest_final_destination(&self, _tables: &TablesData) -> Option<FaceId> {
         debug_assert!(self.region().bound().is_north());
-        debug_assert!(ctx.src_face.region.bound().is_south());
+        None
     }
 
     #[tracing::instrument(level = "debug", skip(ctx), ret)]
@@ -156,6 +152,10 @@ impl HatInterestTrait for Hat {
         debug_assert!(self.region().bound().is_south());
 
         None
+    }
+
+    fn has_remote_interest(&self, _tables: &TablesData, _interest: &RemoteInterest) -> bool {
+        false
     }
 
     #[tracing::instrument(level = "trace", skip(_tables), ret)]

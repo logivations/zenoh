@@ -18,11 +18,16 @@ use zenoh_protocol::{
     core::{Bound, Region, WhatAmI},
     network::{
         declare::{queryable::ext::QueryableInfoType, DeclareToken, TokenId},
-        interest::{InterestMode, InterestOptions},
+        interest::{self, InterestMode, InterestOptions},
+        Interest,
     },
 };
 
 use super::{try_init_tracing_subscriber, Connection, FaceDef, Harness, HarnessBuilder};
+use crate::net::{primitives::Primitives, routing::hat::peer::INITIAL_INTEREST_ID};
+
+#[cfg(debug_assertions)]
+use crate::net::routing::dispatcher::interests::REMOTE_INTEREST_SCAN_COUNT;
 
 /// Test that current tokens are re-propagated even if they've already been propagated in future
 /// mode.
@@ -209,6 +214,60 @@ fn test_concurrent_current_future_interests(north: WhatAmI, south: WhatAmI) {
 
     assert_eq!(s0.recorder().subscribers().len(), 1);
     assert_eq!(s1.recorder().subscribers().len(), 1);
+
+    let shared = n.recorder().interests();
+    for interest in &shared {
+        n.declare_final(interest.id);
+    }
+    // Options and resource are both part of incoming and outgoing identity.
+    s0.interest_wildcard(43, InterestMode::Future, InterestOptions::QUERYABLES);
+    s0.interest(
+        44,
+        InterestMode::Future,
+        InterestOptions::KEYEXPRS + InterestOptions::SUBSCRIBERS,
+        "other/@verbatim",
+    );
+    n.recorder().clear();
+
+    s0.interest_wildcard(42, InterestMode::Final, InterestOptions::empty());
+    assert!(n.recorder().interests().is_empty());
+    s1.interest_wildcard(42, InterestMode::Final, InterestOptions::ALL);
+
+    let mut expected: Vec<_> = shared
+        .iter()
+        .map(|original| Interest {
+            id: original.id,
+            mode: InterestMode::Final,
+            options: original.options,
+            wire_expr: None,
+            ext_qos: interest::ext::QoSType::INTEREST,
+            ext_tstamp: None,
+            ext_nodeid: interest::ext::NodeIdType::DEFAULT,
+        })
+        .collect();
+    let mut finals = n.recorder().interests();
+    expected.sort_by_key(|interest| interest.id);
+    finals.sort_by_key(|interest| interest.id);
+    assert_eq!(finals, expected);
+    {
+        let tables = g.gateway.tables.tables.read().unwrap();
+        assert_eq!(tables.hats[r].remote_interests(&tables.data).len(), 2);
+        let outgoing = &tables.data.faces[&n.face.state.id].local_interests;
+        assert_eq!(outgoing.len(), 2);
+        assert!(shared
+            .iter()
+            .all(|interest| !outgoing.contains_key(&interest.id)));
+        assert!(!s0.face.state.remote_key_interests.contains_key(&42));
+        assert!(!s1.face.state.remote_key_interests.contains_key(&42));
+    }
+
+    // An unknown/duplicate Final still has no effects and performs no ownership scan.
+    #[cfg(debug_assertions)]
+    REMOTE_INTEREST_SCAN_COUNT.with(|count| count.set(0));
+    s0.interest_wildcard(42, InterestMode::Final, InterestOptions::ALL);
+    assert_eq!(n.recorder().interests().len(), 2);
+    #[cfg(debug_assertions)]
+    REMOTE_INTEREST_SCAN_COUNT.with(|count| assert_eq!(count.get(), 0));
 }
 
 /// Re-propagated current-future interest in a two-region hierarchy.
@@ -227,6 +286,13 @@ fn test_current_future_interest_propagation_on_open(north: WhatAmI, south: WhatA
     let s = g.new_face(FaceDef::default().mode(south).region(r));
 
     s.interest_wildcard(42, InterestMode::CurrentFuture, InterestOptions::QUERYABLES);
+    s.interest(
+        43,
+        InterestMode::Future,
+        InterestOptions::QUERYABLES,
+        "retired/**",
+    );
+    s.interest_wildcard(43, InterestMode::Final, InterestOptions::empty());
 
     let n = g.new_face(FaceDef::default().remote_bound(Bound::South));
 
@@ -236,6 +302,30 @@ fn test_current_future_interest_propagation_on_open(north: WhatAmI, south: WhatA
     n.declare_queryable(Some(42), 1999, "k", QueryableInfoType::DEFAULT);
 
     assert_eq!(s.recorder().queryables().len(), 1);
+
+    // Closing the gateway preserves downstream interests for replay. Retire one while
+    // disconnected, then reconnect: only the surviving exact expression is replayed.
+    n.face.send_close();
+    s.interest(
+        44,
+        InterestMode::Future,
+        InterestOptions::QUERYABLES,
+        "kept/@verbatim",
+    );
+    s.interest_wildcard(42, InterestMode::Final, InterestOptions::empty());
+    let reconnected = g.new_face(FaceDef::default().remote_bound(Bound::South));
+    let replayed = reconnected.recorder().interests();
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].mode, InterestMode::CurrentFuture);
+    assert_eq!(replayed[0].options, InterestOptions::QUERYABLES);
+    let tables = g.gateway.tables.tables.read().unwrap();
+    let outgoing = &tables.data.faces[&reconnected.face.state.id].local_interests;
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(
+        outgoing[&replayed[0].id].res.as_ref().unwrap().expr(),
+        "kept/@verbatim"
+    );
+    assert_eq!(tables.hats[r].remote_interests(&tables.data).len(), 1);
 }
 
 /// Test that gateways send back declare final if there is no upstream.
@@ -250,5 +340,120 @@ fn test_current_interest_finalization(mode: WhatAmI) {
 
     s.interest_wildcard(2, InterestMode::CurrentFuture, InterestOptions::ALL);
 
-    assert_eq!(s.recorder().declare_finals().len(), 1)
+    assert_eq!(s.recorder().declare_finals().len(), 1);
+    #[cfg(debug_assertions)]
+    REMOTE_INTEREST_SCAN_COUNT.with(|count| count.set(0));
+    s.interest_wildcard(2, InterestMode::Final, InterestOptions::empty());
+    #[cfg(debug_assertions)]
+    REMOTE_INTEREST_SCAN_COUNT.with(|count| assert_eq!(count.get(), 0));
+    let tables = g.gateway.tables.tables.read().unwrap();
+    assert!(tables.hats[Region::Local]
+        .remote_interests(&tables.data)
+        .is_empty());
+    assert!(!s.face.state.remote_key_interests.contains_key(&2));
+}
+
+/// Removal without an upstream destination still clears owner and peer entity state.
+#[test_case::test_matrix(
+    [WhatAmI::Client, WhatAmI::Peer, WhatAmI::Router],
+    [WhatAmI::Client, WhatAmI::Peer]
+)]
+fn test_interest_final_without_gateway(north: WhatAmI, south: WhatAmI) {
+    let r = Region::default_south(south);
+    let g = HarnessBuilder::new()
+        .mode(north)
+        .subregions([r, Region::Local])
+        .build();
+    let other_peer = (north == WhatAmI::Peer).then(|| {
+        g.new_face(
+            FaceDef::default()
+                .mode(WhatAmI::Peer)
+                .remote_bound(Bound::North),
+        )
+    });
+    let s0 = g.new_face(FaceDef::default().mode(south).region(r));
+    let s1 = g.new_face(FaceDef::default().mode(south).region(r));
+    let entities = g.new_session();
+    entities.declare_subscriber(None, 10, "cleanup/item");
+    entities.declare_queryable(None, 11, "cleanup/item", QueryableInfoType::DEFAULT);
+    let options =
+        InterestOptions::KEYEXPRS + InterestOptions::SUBSCRIBERS + InterestOptions::QUERYABLES;
+    for source in [&s0, &s1] {
+        source.interest(42, InterestMode::CurrentFuture, options, "cleanup/**");
+        assert_eq!(source.recorder().subscribers().len(), 1);
+        assert_eq!(source.recorder().queryables().len(), 1);
+    }
+    let old_subscriber = s0.recorder().subscribers()[0].id;
+    let old_queryable = s0.recorder().queryables()[0].id;
+    s0.recorder().clear();
+
+    #[cfg(debug_assertions)]
+    REMOTE_INTEREST_SCAN_COUNT.with(|count| count.set(0));
+    s0.interest_wildcard(42, InterestMode::Final, InterestOptions::empty());
+    // Reusing a removed ID must create fresh peer subscriber/queryable registrations.
+    s0.interest(42, InterestMode::CurrentFuture, options, "cleanup/**");
+    assert_eq!(s0.recorder().subscribers().len(), 1);
+    assert_eq!(s0.recorder().queryables().len(), 1);
+    if south == WhatAmI::Peer {
+        assert_ne!(s0.recorder().subscribers()[0].id, old_subscriber);
+        assert_ne!(s0.recorder().queryables()[0].id, old_queryable);
+    }
+    s0.interest_wildcard(42, InterestMode::Final, InterestOptions::empty());
+    s1.interest_wildcard(42, InterestMode::Final, InterestOptions::empty());
+    #[cfg(debug_assertions)]
+    REMOTE_INTEREST_SCAN_COUNT.with(|count| assert_eq!(count.get(), 0));
+
+    let tables = g.gateway.tables.tables.read().unwrap();
+    assert!(tables.hats[r].remote_interests(&tables.data).is_empty());
+    assert!(!s0.face.state.remote_key_interests.contains_key(&42));
+    assert!(!s1.face.state.remote_key_interests.contains_key(&42));
+    if let Some(peer) = &other_peer {
+        assert!(peer.recorder().interests().is_empty());
+        let initial = &tables.data.faces[&peer.face.state.id].local_interests;
+        assert_eq!(initial.len(), 1);
+        assert!(initial.contains_key(&INITIAL_INTEREST_ID));
+    }
+}
+
+/// Incoming ownership equality includes mode; outgoing matching retains its existing
+/// resource/options equality. This checks preservation, not a new aggregation contract.
+#[test_case::test_matrix(
+    [WhatAmI::Client, WhatAmI::Peer],
+    [WhatAmI::Client, WhatAmI::Peer]
+)]
+fn test_interest_final_mode_equality(north: WhatAmI, south: WhatAmI) {
+    let r = Region::default_south(south);
+    let g = HarnessBuilder::new().mode(north).subregions([r]).build();
+    let n = g.new_face(FaceDef::default().remote_bound(Bound::South));
+    let s = g.new_face(FaceDef::default().mode(south).region(r));
+    for (id, mode) in [
+        (42, InterestMode::Future),
+        (43, InterestMode::CurrentFuture),
+    ] {
+        s.interest(id, mode, InterestOptions::QUERYABLES, "mode/**");
+    }
+    let outgoing = n.recorder().interests();
+    assert_eq!(outgoing.len(), 2);
+    for interest in &outgoing {
+        if interest.mode.is_current() {
+            n.declare_final(interest.id);
+        }
+    }
+    n.recorder().clear();
+    s.interest_wildcard(42, InterestMode::Final, InterestOptions::empty());
+    let finals = n.recorder().interests();
+    assert_eq!(finals.len(), 2);
+    assert!(finals
+        .iter()
+        .all(|interest| interest.mode == InterestMode::Final));
+    assert!(outgoing
+        .iter()
+        .all(|original| finals.iter().any(|final_| final_.id == original.id)));
+    let tables = g.gateway.tables.tables.read().unwrap();
+    let remaining = tables.hats[r].remote_interests(&tables.data);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        remaining.iter().next().unwrap().mode,
+        InterestMode::CurrentFuture
+    );
 }

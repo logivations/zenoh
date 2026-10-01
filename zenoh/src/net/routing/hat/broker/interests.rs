@@ -29,6 +29,7 @@ use zenoh_protocol::network::{
 use super::Hat;
 use crate::net::routing::{
     dispatcher::{
+        face::FaceId,
         interests::{CurrentInterest, RemoteInterest},
         local_resources::LocalResourceInfoTrait,
         queries::merge_qabl_infos,
@@ -54,12 +55,7 @@ impl HatInterestTrait for Hat {
         unreachable!("north-bound broker hat")
     }
 
-    fn route_interest_final(
-        &mut self,
-        _ctx: DispatcherContext,
-        _msg: &Interest,
-        _remote_interest: &RemoteInterest,
-    ) {
+    fn interest_final_destination(&self, _tables: &TablesData) -> Option<FaceId> {
         unreachable!("north-bound broker hat")
     }
 
@@ -478,15 +474,21 @@ impl HatInterestTrait for Hat {
             return None;
         };
 
-        self.owned_faces(ctx.tables)
-            .all(|face| {
-                !self
-                    .face_hat(face)
-                    .remote_interests
-                    .values()
-                    .contains(&remote_interest)
-            })
-            .then_some(remote_interest)
+        Some(remote_interest)
+    }
+
+    #[tracing::instrument(level = "debug", skip(tables), ret)]
+    fn has_remote_interest(&self, tables: &TablesData, interest: &RemoteInterest) -> bool {
+        #[cfg(all(test, debug_assertions))]
+        crate::net::routing::dispatcher::interests::REMOTE_INTEREST_SCAN_COUNT
+            .with(|count| count.set(count.get() + 1));
+
+        self.owned_faces(tables).any(|face| {
+            self.face_hat(face)
+                .remote_interests
+                .values()
+                .contains(interest)
+        })
     }
 
     #[tracing::instrument(level = "trace", skip(tables), ret)]
