@@ -105,16 +105,6 @@ impl Hat {
     {
         tables.faces.values().filter(|face| self.owns(face))
     }
-
-    pub(crate) fn owned_faces_mut<'h, 't>(
-        &'h self,
-        tables: &'t mut TablesData,
-    ) -> impl Iterator<Item = &'t mut Arc<FaceState>> + 'h
-    where
-        't: 'h,
-    {
-        tables.faces.values_mut().filter(|face| self.owns(face))
-    }
 }
 
 impl HatBaseTrait for Hat {
