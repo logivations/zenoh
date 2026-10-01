@@ -78,6 +78,16 @@ impl fmt::Debug for RemoteInterest {
 }
 
 impl RemoteInterest {
+    // Future and CurrentFuture both own future updates for this expression/options.
+    // Current replies are tracked separately by PendingCurrentInterest.
+    pub(crate) fn same_future_interest(
+        &self,
+        options: InterestOptions,
+        res: &Option<Arc<Resource>>,
+    ) -> bool {
+        self.options == options && &self.res == res
+    }
+
     pub(crate) fn matches(&self, res: &Arc<Resource>) -> bool {
         self.res.as_ref().map(|r| r.matches(res)).unwrap_or(true)
     }

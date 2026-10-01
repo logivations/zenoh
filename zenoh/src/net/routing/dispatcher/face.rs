@@ -106,7 +106,7 @@ impl InterestState {
 
 impl PartialEq<RemoteInterest> for InterestState {
     fn eq(&self, other: &RemoteInterest) -> bool {
-        self.options == other.options && self.res == other.res
+        other.same_future_interest(self.options, &self.res)
     }
 }
 

@@ -4216,3 +4216,211 @@ async fn test_liveliness_sub_history_conflict() {
 
     test_context.close().await;
 }
+
+async fn mixed_history_event(
+    handler: &zenoh::handlers::FifoChannelHandler<zenoh::sample::Sample>,
+    key: &str,
+    kind: zenoh::sample::SampleKind,
+) -> Result<(), String> {
+    let sample = tokio::time::timeout(std::time::Duration::from_secs(3), handler.recv_async())
+        .await
+        .map_err(|_| format!("timeout waiting for {kind:?} {key}"))?
+        .map_err(|error| format!("closed channel waiting for {kind:?} {key}: {error}"))?;
+    if sample.kind() != kind || sample.key_expr().as_str() != key {
+        return Err(format!(
+            "expected {kind:?} {key}, got {:?} {}",
+            sample.kind(),
+            sample.key_expr()
+        ));
+    }
+    Ok(())
+}
+
+async fn mixed_history_barrier(session: &zenoh::Session, key: &str) -> Result<(), String> {
+    use std::time::Duration;
+
+    let replies = session
+        .liveliness()
+        .get(key)
+        .timeout(Duration::from_secs(3))
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut count = 0;
+        while let Ok(reply) = replies.recv_async().await {
+            let sample = reply.into_result().map_err(|e| e.to_string())?;
+            if sample.kind() != zenoh::sample::SampleKind::Put || sample.key_expr().as_str() != key
+            {
+                return Err("unexpected sentinel current-query reply".to_string());
+            }
+            count += 1;
+        }
+        (count > 0)
+            .then_some(())
+            .ok_or_else(|| "sentinel current query returned no token".to_string())
+    })
+    .await
+    .map_err(|_| "sentinel current query did not complete".to_string())?
+}
+
+/// Both history settings own future notifications until their own undeclaration.
+/// A client/pull topology exercises outgoing interest retirement; a peer clique can hide it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_liveliness_mixed_history_survivor() {
+    use zenoh::{config::WhatAmI, sample::SampleKind};
+
+    let mut results = Vec::new();
+    for remove_history in [false, true] {
+        let mut sessions = TestSessions::new();
+        let outcome: Result<(), String> = async {
+            let mut config = sessions.get_listener_config("tcp/127.0.0.1:0", 1);
+            config.set_mode(Some(WhatAmI::Router)).unwrap();
+            let gateway = sessions.open_listener_with_cfg(config).await;
+            let mut config = sessions.get_connector_config();
+            config.set_mode(Some(WhatAmI::Client)).unwrap();
+            let subscriber = sessions.open_connector_with_cfg(config.clone()).await;
+            let publisher = sessions.open_connector_with_cfg(config).await;
+            let prefix = format!("test/liveliness/mixed_history/{remove_history}");
+            let target = format!("{prefix}/target/**");
+            let before = format!("{prefix}/target/before");
+            let after = format!("{prefix}/target/after");
+            let sentinel_key = format!("{prefix}/sentinel/**");
+            let sentinel_before = format!("{prefix}/sentinel/before");
+            let sentinel_after = format!("{prefix}/sentinel/after");
+
+            // Register the sentinel locally at the gateway before subscriptions exist.
+            let sentinel_token = gateway
+                .liveliness()
+                .declare_token(&sentinel_before)
+                .await
+                .map_err(|e| e.to_string())?;
+            let future = subscriber
+                .liveliness()
+                .declare_subscriber(&target)
+                .history(false)
+                .await
+                .map_err(|e| e.to_string())?;
+            let history = subscriber
+                .liveliness()
+                .declare_subscriber(&target)
+                .history(true)
+                .await
+                .map_err(|e| e.to_string())?;
+            let sentinel = subscriber
+                .liveliness()
+                .declare_subscriber(&sentinel_key)
+                .history(true)
+                .await
+                .map_err(|e| e.to_string())?;
+            // This observer is on the gateway, not another owner on the tested client.
+            let observer = gateway
+                .liveliness()
+                .declare_subscriber(&target)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Observe the sentinel's history reply before querying it. Otherwise its
+            // concurrent arrival can suppress the forwarded Current reply as already
+            // propagated before the query's initial routing-cache snapshot contains it.
+            mixed_history_event(sentinel.handler(), &sentinel_before, SampleKind::Put)
+                .await
+                .map_err(|e| format!("initial sentinel readiness: {e}"))?;
+            // A current reply may now use routing state; query completion still follows
+            // its separate upstream current-interest/DeclareFinal exchange.
+            mixed_history_barrier(&subscriber, &sentinel_before)
+                .await
+                .map_err(|e| format!("initial barrier: {e}"))?;
+            let before_token = publisher
+                .liveliness()
+                .declare_token(&before)
+                .await
+                .map_err(|e| e.to_string())?;
+            mixed_history_event(future.handler(), &before, SampleKind::Put).await?;
+            mixed_history_event(history.handler(), &before, SampleKind::Put).await?;
+            mixed_history_event(observer.handler(), &before, SampleKind::Put).await?;
+            println!(
+                "MIXED_HISTORY {}",
+                serde_json::json!({
+                    "remove_history": remove_history, "stage": "ready",
+                    "both_target_subscribers": true, "gateway_observer": true,
+                    "subscriber_sentinel": true
+                })
+            );
+
+            let (removed, survivor) = if remove_history {
+                (history, future)
+            } else {
+                (future, history)
+            };
+            removed.undeclare().await.map_err(|e| e.to_string())?;
+
+            // Complete a subsequent public current-interest round trip on the healthy
+            // sentinel path. Do not use an arbitrary sleep as proof of propagation.
+            mixed_history_barrier(&subscriber, &sentinel_before)
+                .await
+                .map_err(|e| format!("post-undeclare barrier: {e}"))?;
+
+            // Keep /before alive: neither buffered history nor its Delete can satisfy
+            // the exact fresh /after event oracle.
+            let after_token = publisher
+                .liveliness()
+                .declare_token(&after)
+                .await
+                .map_err(|e| e.to_string())?;
+            let sentinel_after_token = publisher
+                .liveliness()
+                .declare_token(&sentinel_after)
+                .await
+                .map_err(|e| e.to_string())?;
+            let gateway_put =
+                mixed_history_event(observer.handler(), &after, SampleKind::Put).await;
+            let sentinel_put =
+                mixed_history_event(sentinel.handler(), &sentinel_after, SampleKind::Put).await;
+            let survivor_put =
+                mixed_history_event(survivor.handler(), &after, SampleKind::Put).await;
+            after_token.undeclare().await.map_err(|e| e.to_string())?;
+            sentinel_after_token
+                .undeclare()
+                .await
+                .map_err(|e| e.to_string())?;
+            let gateway_delete =
+                mixed_history_event(observer.handler(), &after, SampleKind::Delete).await;
+            let sentinel_delete =
+                mixed_history_event(sentinel.handler(), &sentinel_after, SampleKind::Delete).await;
+            let survivor_delete =
+                mixed_history_event(survivor.handler(), &after, SampleKind::Delete).await;
+            println!(
+                "MIXED_HISTORY {}",
+                serde_json::json!({
+                    "remove_history": remove_history, "stage": "after_unsubscribe",
+                    "gateway_put": gateway_put, "sentinel_put": sentinel_put,
+                    "survivor_put": survivor_put, "gateway_delete": gateway_delete,
+                    "sentinel_delete": sentinel_delete, "survivor_delete": survivor_delete
+                })
+            );
+
+            // Validate controls separately so a setup/transport failure cannot be
+            // reported as selective survivor loss. Session cleanup runs on every result.
+            gateway_put?;
+            sentinel_put?;
+            gateway_delete?;
+            sentinel_delete?;
+            let target_result = survivor_put.and(survivor_delete);
+            survivor.undeclare().await.map_err(|e| e.to_string())?;
+            observer.undeclare().await.map_err(|e| e.to_string())?;
+            sentinel.undeclare().await.map_err(|e| e.to_string())?;
+            before_token.undeclare().await.map_err(|e| e.to_string())?;
+            sentinel_token
+                .undeclare()
+                .await
+                .map_err(|e| e.to_string())?;
+            target_result
+        }
+        .await;
+        sessions.close().await;
+        results.push((remove_history, outcome));
+    }
+    assert!(
+        results.iter().all(|(_, outcome)| outcome.is_ok()),
+        "{results:?}"
+    );
+}

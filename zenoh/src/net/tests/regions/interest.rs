@@ -415,13 +415,13 @@ fn test_interest_final_without_gateway(north: WhatAmI, south: WhatAmI) {
     }
 }
 
-/// Incoming ownership equality includes mode; outgoing matching retains its existing
-/// resource/options equality. This checks preservation, not a new aggregation contract.
+/// Both future modes retain the outgoing group until the last future owner leaves.
 #[test_case::test_matrix(
     [WhatAmI::Client, WhatAmI::Peer],
-    [WhatAmI::Client, WhatAmI::Peer]
+    [WhatAmI::Client, WhatAmI::Peer],
+    [false, true]
 )]
-fn test_interest_final_mode_equality(north: WhatAmI, south: WhatAmI) {
+fn test_interest_final_mixed_modes(north: WhatAmI, south: WhatAmI, remove_history: bool) {
     let r = Region::default_south(south);
     let g = HarnessBuilder::new().mode(north).subregions([r]).build();
     let n = g.new_face(FaceDef::default().remote_bound(Bound::South));
@@ -434,26 +434,67 @@ fn test_interest_final_mode_equality(north: WhatAmI, south: WhatAmI) {
     }
     let outgoing = n.recorder().interests();
     assert_eq!(outgoing.len(), 2);
-    for interest in &outgoing {
-        if interest.mode.is_current() {
-            n.declare_final(interest.id);
-        }
+    let current_id = outgoing
+        .iter()
+        .find(|interest| interest.mode == InterestMode::CurrentFuture)
+        .unwrap()
+        .id;
+    {
+        let tables = g.gateway.tables.tables.read().unwrap();
+        // Preserve distinct stored modes and replay equality, not just one merged record.
+        assert_eq!(tables.hats[r].remote_interests(&tables.data).len(), 2);
+        assert!(tables.data.faces[&n.face.state.id]
+            .pending_current_interests
+            .contains_key(&current_id));
     }
+    let (removed, last, survivor_mode) = if remove_history {
+        (43, 42, InterestMode::Future)
+    } else {
+        (42, 43, InterestMode::CurrentFuture)
+    };
     n.recorder().clear();
-    s.interest_wildcard(42, InterestMode::Final, InterestOptions::empty());
-    let finals = n.recorder().interests();
-    assert_eq!(finals.len(), 2);
-    assert!(finals
+    s.interest_wildcard(removed, InterestMode::Final, InterestOptions::empty());
+    assert!(n.recorder().interests().is_empty());
+    {
+        let tables = g.gateway.tables.tables.read().unwrap();
+        let remaining = tables.hats[r].remote_interests(&tables.data);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.iter().next().unwrap().mode, survivor_mode);
+        let face = &tables.data.faces[&n.face.state.id];
+        assert_eq!(face.local_interests.len(), 2);
+        assert!(face.pending_current_interests.contains_key(&current_id));
+    }
+
+    // Finishing the current snapshot is independent of remaining future ownership.
+    n.declare_final(current_id);
+    assert_eq!(s.recorder().declare_finals().len(), 1);
+    {
+        let tables = g.gateway.tables.tables.read().unwrap();
+        let face = &tables.data.faces[&n.face.state.id];
+        assert!(!face.pending_current_interests.contains_key(&current_id));
+        assert_eq!(face.local_interests.len(), 2);
+        assert!(face.local_interests[&current_id].finalized);
+    }
+    s.interest_wildcard(last, InterestMode::Final, InterestOptions::empty());
+    let mut finals = n.recorder().interests();
+    let mut expected: Vec<_> = outgoing
         .iter()
-        .all(|interest| interest.mode == InterestMode::Final));
-    assert!(outgoing
-        .iter()
-        .all(|original| finals.iter().any(|final_| final_.id == original.id)));
+        .map(|original| Interest {
+            id: original.id,
+            mode: InterestMode::Final,
+            options: original.options,
+            wire_expr: None,
+            ext_qos: interest::ext::QoSType::INTEREST,
+            ext_tstamp: None,
+            ext_nodeid: interest::ext::NodeIdType::DEFAULT,
+        })
+        .collect();
+    finals.sort_by_key(|interest| interest.id);
+    expected.sort_by_key(|interest| interest.id);
+    assert_eq!(finals, expected);
     let tables = g.gateway.tables.tables.read().unwrap();
-    let remaining = tables.hats[r].remote_interests(&tables.data);
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(
-        remaining.iter().next().unwrap().mode,
-        InterestMode::CurrentFuture
-    );
+    assert!(tables.hats[r].remote_interests(&tables.data).is_empty());
+    assert!(tables.data.faces[&n.face.state.id]
+        .local_interests
+        .is_empty());
 }

@@ -433,7 +433,7 @@ pub(crate) trait HatInterestTrait {
         msg: &Interest,
     ) -> Option<RemoteInterest>;
 
-    /// Whether an equal incoming interest remains in this hat's owned faces.
+    /// Whether an owned incoming interest still requests the same future updates.
     fn has_remote_interest(&self, tables: &TablesData, interest: &RemoteInterest) -> bool;
 
     fn remote_interests(&self, tables: &TablesData) -> HashSet<RemoteInterest>;

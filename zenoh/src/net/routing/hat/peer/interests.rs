@@ -712,7 +712,7 @@ impl HatInterestTrait for Hat {
             self.face_hat(face)
                 .remote_interests
                 .values()
-                .contains(interest)
+                .any(|other| interest.same_future_interest(other.options, &other.res))
         })
     }
 
