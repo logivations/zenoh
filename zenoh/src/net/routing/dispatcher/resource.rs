@@ -376,6 +376,8 @@ pub struct Resource {
     pub(crate) suffix: usize,
     pub(crate) nonwild_prefix: Option<Arc<Resource>>,
     pub(crate) children: SingleOrBoxHashSet<Child>,
+    // Immediate wildcard children require the general key-expression traversal.
+    wildcard_children: usize,
     pub(crate) ctx: Option<Box<ResourceContext>>,
     pub(crate) face_ctxs: IntHashMap<FaceId, Arc<FaceContext>>,
 }
@@ -459,6 +461,7 @@ impl Resource {
             suffix: parent.expr.len(),
             nonwild_prefix,
             children: SingleOrBoxHashSet::new(),
+            wildcard_children: 0,
             ctx: context.map(Box::new),
             face_ctxs: IntHashMap::new(),
         }
@@ -526,6 +529,7 @@ impl Resource {
             suffix: 0,
             nonwild_prefix: None,
             children: SingleOrBoxHashSet::new(),
+            wildcard_children: 0,
             ctx: None,
             face_ctxs: IntHashMap::new(),
         })
@@ -554,7 +558,10 @@ impl Resource {
                 }
                 mutres.nonwild_prefix.take();
                 {
-                    get_mut_unchecked(parent).children.remove(res.suffix());
+                    let parent = get_mut_unchecked(parent);
+                    if parent.children.remove(res.suffix()) && res.suffix().contains('*') {
+                        parent.wildcard_children -= 1;
+                    }
                 }
                 Resource::clean(parent);
             }
@@ -566,6 +573,7 @@ impl Resource {
         for mut c in r.children.drain() {
             Self::close(&mut c);
         }
+        r.wildcard_children = 0;
         r.parent.take();
         r.nonwild_prefix.take();
         r.ctx.take();
@@ -603,9 +611,10 @@ impl Resource {
                 if rest.is_empty() {
                     tracing::debug!("Register resource {}", new.expr());
                 }
-                get_mut_unchecked(&mut from)
-                    .children
-                    .insert(Child(new.clone()));
+                let parent = get_mut_unchecked(&mut from);
+                if parent.children.insert(Child(new.clone())) && chunk.contains('*') {
+                    parent.wildcard_children += 1;
+                }
                 from = new;
             };
             suffix = rest;
@@ -808,6 +817,47 @@ impl Resource {
     }
 
     pub fn get_matches(tables: &TablesData, key_expr: &keyexpr) -> Vec<Weak<Resource>> {
+        // A literal chunk only intersects an identical literal chunk. When no
+        // child contains a wildcard, use the existing child hash table instead
+        // of visiting every unrelated sibling. Preserve the original traversal
+        // for wildcard children and the slash-only intermediate resource.
+        #[inline(always)]
+        fn enqueue_children<'a>(
+            key_expr: &'a keyexpr,
+            from: &'a Arc<Resource>,
+            nodes: &mut VecDeque<(&'a keyexpr, &'a Arc<Resource>)>,
+        ) {
+            let children = match &from.children {
+                SingleOrBoxHashSet::Empty => return,
+                SingleOrBoxHashSet::Single(child) => {
+                    nodes.push_back((key_expr, child));
+                    return;
+                }
+                SingleOrBoxHashSet::Set(children) => children,
+            };
+            if children.len() > 1 && from.wildcard_children == 0 && children.get("/").is_none() {
+                let chunk = key_expr
+                    .split_once('/')
+                    .map_or(key_expr.as_str(), |(c, _)| c);
+                if !chunk.contains('*') {
+                    if let Some(child) = children.get(chunk) {
+                        nodes.push_back((key_expr, child));
+                    }
+                    // Resource suffixes may include the separator; accept both
+                    // representations just as the general traversal does.
+                    let mut suffix = String::with_capacity(chunk.len() + 1);
+                    suffix.push('/');
+                    suffix.push_str(chunk);
+                    if let Some(child) = children.get(suffix.as_str()) {
+                        nodes.push_back((key_expr, child));
+                    }
+                    return;
+                }
+            }
+            for child in children.iter() {
+                nodes.push_back((key_expr, child));
+            }
+        }
         pub fn visit_nodes<T>(node: T, mut visit: impl FnMut(T, &mut VecDeque<T>)) {
             let mut nodes = VecDeque::from([node]);
             while let Some(node) = nodes.pop_front() {
@@ -819,11 +869,15 @@ impl Resource {
             from: &Arc<Resource>,
             matches: &mut Vec<Weak<Resource>>,
         ) {
+            #[cfg(test)]
+            let mut visited = 0;
             visit_nodes((key_expr, from), |(key_expr, from), nodes| {
+                #[cfg(test)]
+                {
+                    visited += 1;
+                }
                 if from.parent.is_none() || from.suffix() == "/" {
-                    for child in from.children.iter() {
-                        nodes.push_back((key_expr, child));
-                    }
+                    enqueue_children(key_expr, from, nodes);
                     return;
                 }
                 let suffix: &keyexpr = from
@@ -860,9 +914,7 @@ impl Resource {
                             }
                         }
                         if (ke_chunk_is_wild && ke_chunk_intersects_suffix) || suffix_is_wild {
-                            for child in from.children.iter() {
-                                nodes.push_back((key_expr, child));
-                            }
+                            enqueue_children(key_expr, from, nodes);
                         }
                     }
                     Some(rest) => {
@@ -872,19 +924,19 @@ impl Resource {
                         {
                             matches.push(Arc::downgrade(from));
                         }
-                        for child in from.children.iter() {
-                            if (ke_chunk_is_wild && ke_chunk_intersects_suffix) || suffix_is_wild {
-                                nodes.push_back((key_expr, child));
-                            } else if ke_chunk_intersects_suffix {
-                                nodes.push_back((rest, child));
-                            }
+                        if (ke_chunk_is_wild && ke_chunk_intersects_suffix) || suffix_is_wild {
+                            enqueue_children(key_expr, from, nodes);
+                        } else if ke_chunk_intersects_suffix {
+                            enqueue_children(rest, from, nodes);
                         }
                         if (suffix_is_wild && ke_chunk_intersects_suffix) || ke_chunk_is_wild {
                             nodes.push_back((rest, from));
                         }
                     }
                 };
-            })
+            });
+            #[cfg(test)]
+            literal_child_tests::LAST_VISITS.set(visited);
         }
         let mut matches = Vec::new();
         get_matches_from(key_expr, &tables.root_res, &mut matches);
@@ -1090,5 +1142,391 @@ pub(crate) fn register_expr_interest(
             .remote_key_interests
             .insert(id, None);
         drop(wtables);
+    }
+}
+
+#[cfg(test)]
+mod literal_child_tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::net::{primitives::DummyPrimitives, routing::gateway::GatewayBuilder};
+    use zenoh_protocol::core::WhatAmI;
+
+    std::thread_local! {
+        pub(super) static LAST_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    fn new_router() -> crate::net::routing::gateway::Gateway {
+        let mut config = zenoh_config::Config::default().expanded();
+        config.set_mode(Some(WhatAmI::Client)).unwrap();
+        GatewayBuilder::new(&config)
+            .subregions(vec![Region::Local])
+            .build()
+            .unwrap()
+    }
+
+    fn names(matches: Vec<Weak<Resource>>) -> BTreeSet<String> {
+        matches
+            .into_iter()
+            .map(|resource| resource.upgrade().unwrap().expr().to_owned())
+            .collect()
+    }
+
+    fn check_child_counts(resource: &Arc<Resource>) {
+        assert_eq!(
+            resource.wildcard_children,
+            resource
+                .children
+                .iter()
+                .filter(|child| child.suffix().contains('*'))
+                .count(),
+            "wildcard child count at {}",
+            resource.expr(),
+        );
+        for child in resource.children.iter() {
+            check_child_counts(child);
+        }
+    }
+
+    // Walk the entire tree independently of get_matches/pruning. Validate full
+    // expressions because wire mappings may end at a slash-only intermediate.
+    fn intersecting_resources(root: &Arc<Resource>, query: &keyexpr) -> Vec<*const Resource> {
+        let mut expected = Vec::new();
+        let mut pending = vec![root];
+        while let Some(resource) = pending.pop() {
+            if resource.ctx.is_some()
+                && keyexpr::new(resource.expr()).is_ok_and(|key| query.intersects(key))
+            {
+                expected.push(Arc::as_ptr(resource));
+            }
+            pending.extend(resource.children.iter().map(|child| &child.0));
+        }
+        expected.sort_unstable();
+        expected
+    }
+
+    fn assert_query_matches(tables: &TablesData, query: &keyexpr) -> BTreeSet<String> {
+        let actual = Resource::get_matches(tables, query);
+        assert_eq!(
+            actual.iter().map(Weak::as_ptr).collect::<Vec<_>>(),
+            intersecting_resources(&tables.root_res, query),
+            "keyexpr::intersects resource identities differ for {query}",
+        );
+        names(actual)
+    }
+
+    fn assert_queries_match_intersection(tables: &TablesLock, queries: &[String]) {
+        let tables = zread!(tables.tables);
+        check_child_counts(&tables.data.root_res);
+        for query in queries {
+            assert_query_matches(&tables.data, keyexpr::new(query).unwrap());
+        }
+    }
+
+    // Includes the upstream matching corpus, namespace prefixes, verbatim
+    // chunks, non-declared queries, and combinations at different tree levels.
+    fn corpus() -> Vec<String> {
+        let mut keys = [
+            "**",
+            "a",
+            "a/b",
+            "*",
+            "a/*",
+            "a/b$*",
+            "abc",
+            "xx",
+            "ab$*",
+            "abcd",
+            "ab$*d",
+            "ab",
+            "ab/*",
+            "a/*/c/*/e",
+            "a/b/c/d/e",
+            "a/$*b/c/$*d/e",
+            "a/xb/c/xd/e",
+            "a/c/e",
+            "a/b/c/d/x/e",
+            "ab$*cd",
+            "abxxcxxd",
+            "abxxcxxcd",
+            "abxxcxxcdx",
+            "a/b/c",
+            "ab/**",
+            "**/xyz",
+            "a/b/xyz/d/e/f/xyz",
+            "**/xyz$*xyz",
+            "a/**/c/**/e",
+            "a/b/b/b/c/d/d/d/e",
+            "a/**/c/*/e/*",
+            "a/b/b/b/c/d/d/c/d/e/f",
+            "x/abc",
+            "x/*",
+            "x/abc$*",
+            "x/$*abc",
+            "x/a$*",
+            "x/a$*de",
+            "x/abc$*de",
+            "x/a$*d$*e",
+            "x/a$*e",
+            "x/a$*c$*e",
+            "x/ade",
+            "x/c$*",
+            "x/$*d",
+            "x/$*e",
+            "@a",
+            "**/@a",
+            "@a/b",
+            "ns/a/b",
+            "ns/**",
+            "ns/@private/x",
+            "ns/@private/**",
+            "ns/*/x",
+            "ns/**/@private/**",
+            "@/z/@ros2_lv/SC/service",
+            "@/z/@ros2_lv/**",
+            "@a/**",
+            "namespace/stress/base_0",
+            "namespace/stress/base_1",
+            "namespace/stress/base_$*",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        for first in ["alpha", "beta", "@hidden", "*", "**", "pre$*post"] {
+            for second in ["alpha", "beta", "@hidden", "*", "**", "pre$*post"] {
+                let key = format!("generated/{first}/{second}");
+                if keyexpr::new(&key).is_ok() {
+                    keys.push(key);
+                }
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        for key in &keys {
+            keyexpr::new(key).unwrap();
+        }
+        keys
+    }
+
+    #[test]
+    fn literal_child_pruning_matches_intersection_across_insert_and_remove() {
+        let router = new_router();
+        let tables = router.tables.clone();
+        let mut face = router
+            .new_session(Arc::new(DummyPrimitives {}))
+            .state
+            .clone();
+        let keys = corpus();
+        let mut queries = keys.clone();
+        queries.extend(
+            [
+                "missing/path",
+                "namespace/stress/base_999",
+                "ns/@private/missing",
+                "generated/pre-middle-post/alpha",
+                "a/b/c/d",
+                "other/**",
+            ]
+            .map(str::to_owned),
+        );
+        assert_queries_match_intersection(&tables, &queries);
+        for (index, key) in keys.iter().enumerate().step_by(2) {
+            register_expr(
+                &tables,
+                &mut face,
+                (index + 1).try_into().unwrap(),
+                &key.as_str().into(),
+            );
+        }
+        assert_queries_match_intersection(&tables, &queries);
+        for (index, key) in keys.iter().enumerate().skip(1).step_by(2) {
+            register_expr(
+                &tables,
+                &mut face,
+                (index + 1).try_into().unwrap(),
+                &key.as_str().into(),
+            );
+        }
+        assert_queries_match_intersection(&tables, &queries);
+        for index in (0..keys.len()).step_by(3) {
+            unregister_expr(&tables, &mut face, (index + 1).try_into().unwrap());
+        }
+        assert_queries_match_intersection(&tables, &queries);
+        for index in (0..keys.len()).step_by(3).rev() {
+            register_expr(
+                &tables,
+                &mut face,
+                (index + 1).try_into().unwrap(),
+                &keys[index].as_str().into(),
+            );
+        }
+        assert_queries_match_intersection(&tables, &queries);
+        for index in (0..keys.len()).rev() {
+            unregister_expr(&tables, &mut face, (index + 1).try_into().unwrap());
+        }
+        assert_queries_match_intersection(&tables, &queries);
+        assert!(zread!(tables.tables).data.root_res.children.is_empty());
+    }
+
+    #[test]
+    fn literal_child_pruning_visits_do_not_grow_with_unrelated_siblings() {
+        for siblings in [1_u16, 64, 1024] {
+            let router = new_router();
+            let tables = router.tables.clone();
+            let mut face = router
+                .new_session(Arc::new(DummyPrimitives {}))
+                .state
+                .clone();
+            for index in 0..siblings {
+                let key = format!("root/app/service_{index}");
+                register_expr(&tables, &mut face, index + 1, &key.into());
+            }
+            let query = keyexpr::new("root/app/service_0").unwrap();
+            {
+                let tables = zread!(tables.tables);
+                let actual = assert_query_matches(&tables.data, query);
+                assert_eq!(actual, BTreeSet::from(["root/app/service_0".to_owned()]));
+                assert_eq!(
+                    LAST_VISITS.get(),
+                    4,
+                    "literal lookup should follow only root/app/service_0"
+                );
+            }
+            // Wildcards must use the general algorithm, and removing the last
+            // wildcard must restore literal lookup rather than retaining a flag.
+            register_expr(
+                &tables,
+                &mut face,
+                siblings + 1,
+                &"root/app/service_$*".into(),
+            );
+            {
+                let tables = zread!(tables.tables);
+                check_child_counts(&tables.data.root_res);
+                let actual = assert_query_matches(&tables.data, query);
+                assert_eq!(actual.len(), 2);
+                assert_eq!(LAST_VISITS.get(), u64::from(siblings) + 4);
+            }
+            unregister_expr(&tables, &mut face, siblings + 1);
+            {
+                let tables = zread!(tables.tables);
+                check_child_counts(&tables.data.root_res);
+                assert_query_matches(&tables.data, query);
+                assert_eq!(LAST_VISITS.get(), 4);
+            }
+            for index in (0..siblings).rev() {
+                unregister_expr(&tables, &mut face, index + 1);
+            }
+            check_child_counts(&zread!(tables.tables).data.root_res);
+            assert!(zread!(tables.tables).data.root_res.children.is_empty());
+        }
+    }
+
+    #[test]
+    fn literal_child_pruning_close_clears_wildcard_counts() {
+        let router = new_router();
+        let tables = router.tables.clone();
+        let mut face = router
+            .new_session(Arc::new(DummyPrimitives {}))
+            .state
+            .clone();
+        for (index, key) in ["a/**/b", "a/*/c", "ns/@verbatim/x", "ns/literal/x"]
+            .iter()
+            .enumerate()
+        {
+            register_expr(
+                &tables,
+                &mut face,
+                (index + 1).try_into().unwrap(),
+                &(*key).into(),
+            );
+        }
+        let tables = zwrite!(tables.tables);
+        let mut root = tables.data.root_res.clone();
+        let mut retained = Vec::new();
+        let mut pending = vec![root.clone()];
+        while let Some(resource) = pending.pop() {
+            pending.extend(resource.children.iter().map(|child| child.0.clone()));
+            retained.push(resource);
+        }
+        Resource::close(&mut root);
+        for resource in retained {
+            assert_eq!(resource.wildcard_children, 0);
+            assert_eq!(resource.children.len(), 0);
+        }
+    }
+
+    #[test]
+    fn literal_child_pruning_preserves_mapped_and_partial_prefixes() {
+        let router = new_router();
+        let tables = router.tables.clone();
+        let mut face = router
+            .new_session(Arc::new(DummyPrimitives {}))
+            .state
+            .clone();
+        // Wire resource prefixes can end at a separator or inside a chunk.
+        register_expr(&tables, &mut face, 1, &"mapped/".into());
+        register_expr(
+            &tables,
+            &mut face,
+            2,
+            &WireExpr::from(1).with_suffix("topic"),
+        );
+        register_expr(&tables, &mut face, 3, &"mapped/ser".into());
+        register_expr(
+            &tables,
+            &mut face,
+            4,
+            &WireExpr::from(3).with_suffix("vice/request"),
+        );
+        register_expr(
+            &tables,
+            &mut face,
+            5,
+            &WireExpr::from(4).with_suffix("/@private/x"),
+        );
+        register_expr(
+            &tables,
+            &mut face,
+            6,
+            &WireExpr::from(1).with_suffix("service/**"),
+        );
+        let queries = [
+            "mapped/topic",
+            "mapped/*",
+            "mapped/**",
+            "mapped/service/request",
+            "mapped/service/**",
+            "mapped/service/request/@private/x",
+            "mapped/service/request/**/@private/*",
+            "**/@private/x",
+            "mapped/missing",
+        ];
+        for slash_prefix_present in [true, false] {
+            if !slash_prefix_present {
+                unregister_expr(&tables, &mut face, 1);
+            }
+            let tables = zread!(tables.tables);
+            check_child_counts(&tables.data.root_res);
+            for query in queries {
+                assert_query_matches(&tables.data, keyexpr::new(query).unwrap());
+            }
+            let parent = Resource::get_resource_ref(&tables.data.root_res, "mapped").unwrap();
+            assert_eq!(parent.children.get("/").is_some(), slash_prefix_present);
+            let request =
+                Resource::get_resource_ref(&tables.data.root_res, "mapped/service/request")
+                    .unwrap();
+            let leaf = Resource::get_resource_ref(request, "/@private/x").unwrap();
+            assert_eq!(leaf.expr(), "mapped/service/request/@private/x");
+            assert!(leaf.ctx.is_some());
+            let topic_matches =
+                assert_query_matches(&tables.data, keyexpr::new("mapped/topic").unwrap());
+            assert_eq!(topic_matches, BTreeSet::from(["mapped/topic".to_owned()]));
+        }
+        for id in (2..=6).rev() {
+            unregister_expr(&tables, &mut face, id);
+        }
+        check_child_counts(&zread!(tables.tables).data.root_res);
+        assert!(zread!(tables.tables).data.root_res.children.is_empty());
     }
 }
