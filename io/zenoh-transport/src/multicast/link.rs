@@ -315,8 +315,6 @@ impl TransportLinkMulticastUniversal {
                     .config
                     .max_wait_before_drop_fragments,
                 wait_before_close: self.transport.manager.config.wait_before_close,
-                // a multicast transport is not closed when a blocking push fails
-                refuse_after_block_failure: false,
                 batching_enabled: self.transport.manager.config.batching,
                 batching_time_limit: self.transport.manager.config.queue_backoff,
                 queue_alloc: self.transport.manager.config.queue_alloc,
@@ -453,9 +451,7 @@ async fn tx_task(
                         pipeline.refill(batch, priority);
                     }
                     None => {
-                        // Drain the transmission pipeline and write remaining bytes on the wire,
-                        // after releasing the producers that wait for a free batch (see unicast)
-                        pipeline.disable_producers();
+                        // Drain the transmission pipeline and write remaining bytes on the wire
                         let mut batches = pipeline.drain();
                         for (mut b, _) in batches.drain(..) {
                             tokio::time::timeout(config.join_interval, link.send_batch(&mut b))
