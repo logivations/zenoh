@@ -532,6 +532,7 @@ impl Primitives for AdminSpace {
                 let zid = self.zid;
                 let query = Query {
                     inner: Arc::new(QueryInner {
+                        discarded: false.into(),
                         key_expr: key_expr.clone(),
                         parameters: mem::take(&mut query.parameters).into(),
                         qid: msg.id,

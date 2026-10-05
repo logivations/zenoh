@@ -15,7 +15,10 @@ use std::{
     fmt,
     future::{IntoFuture, Ready},
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use tracing::error;
@@ -114,6 +117,7 @@ impl ReplyPrimitives {
 }
 
 pub(crate) struct QueryInner {
+    pub(crate) discarded: AtomicBool,
     pub(crate) key_expr: KeyExpr<'static>,
     pub(crate) parameters: Parameters<'static>,
     pub(crate) qid: RequestId,
@@ -132,6 +136,7 @@ impl QueryInner {
     #[zenoh_macros::internal]
     fn empty() -> Self {
         QueryInner {
+            discarded: AtomicBool::new(false),
             key_expr: KeyExpr::dummy(),
             parameters: Parameters::empty(),
             qid: 0,
@@ -150,6 +155,12 @@ impl QueryInner {
 
 impl Drop for QueryInner {
     fn drop(&mut self) {
+        if self.discarded.load(Ordering::Relaxed) {
+            if let ReplyPrimitives::Remote(remote) = &self.primitives {
+                remote.primitives.discard_query(self.qid);
+            }
+            return;
+        }
         self.primitives.send_response_final(&mut ResponseFinal {
             rid: self.qid,
             ext_qos: self.qos.into(),
@@ -490,6 +501,19 @@ impl Query {
             value: None,
             attachment: None,
         }
+    }
+
+    /// Abandon finalization of this query. Other clones may still reply, but
+    /// the last clone releases local routing state without sending a final
+    /// response. The querier may therefore wait until its timeout.
+    ///
+    /// Unlike `Drop`, this does not send on the transport. It is intended for
+    /// rejecting work on a callback that must not wait for a congested peer.
+    #[zenoh_macros::internal]
+    pub fn discard(self) {
+        // The dispatcher can still hold a clone while the callback runs.
+        // Suppress finalization even if that clone becomes the last owner.
+        self.inner.discarded.store(true, Ordering::Relaxed);
     }
 
     /// Gets the Priority policy of this Query.

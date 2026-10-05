@@ -701,6 +701,18 @@ impl Primitives for Face {
         route_send_response_final(&self.tables, &mut self.state.clone(), msg.rid);
     }
 
+    fn discard_query(&self, qid: RequestId) {
+        let query = {
+            let _guard = zenoh_core::zwrite!(self.tables.queries_lock);
+            get_mut_unchecked(&mut self.state.clone())
+                .pending_queries
+                .remove(&qid)
+        };
+        if let Some((_, cancellation)) = query {
+            cancellation.cancel();
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self), fields(src = %self), ret)]
     fn send_close(&self) {
         let mut state = self.state.clone();
