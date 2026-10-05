@@ -129,6 +129,8 @@ impl TransportLinkUnicastUniversal {
             wait_before_drop: transport.manager.config.wait_before_drop,
             max_wait_before_drop_fragments: transport.manager.config.max_wait_before_drop_fragments,
             wait_before_close: transport.manager.config.wait_before_close,
+            // handle_push_result() closes the transport when a blocking push fails
+            refuse_after_block_failure: true,
             batching_enabled: transport.manager.config.batching,
             batching_time_limit: transport.manager.config.queue_backoff,
             queue_alloc: transport.manager.config.queue_alloc,
@@ -367,7 +369,11 @@ async fn write_loop(
         result?;
     }
 
-    // Drain the transmission pipeline and write remaining bytes on the wire
+    // Drain the transmission pipeline and write remaining bytes on the wire. Producers that
+    // wait for a free batch hold the locks drain() takes, and no batch will be refilled any
+    // more: release them first. Otherwise drain() blocks the TX runtime thread, and with it
+    // the TX of every other link, for up to `wait_before_close` per waiting producer.
+    pipeline.disable_producers();
     let mut batches = pipeline.drain();
     for (mut b, _) in batches.drain(..) {
         tokio::time::timeout(

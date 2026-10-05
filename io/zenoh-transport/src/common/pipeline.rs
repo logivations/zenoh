@@ -315,6 +315,12 @@ impl StageIn {
                                 break batch;
                             }
                             None => {
+                                // A disabled pipeline gets no more refills, and waiting here
+                                // would hold the locks that the consumer needs to drain it.
+                                if c_guard.status.is_disabled() {
+                                    $($restore_sn)?
+                                    return Err(TransportClosed);
+                                }
                                 // Wait for an available batch until deadline
                                 if !deadline.wait(&self.s_ref)? {
                                     // Still no available batch.
@@ -657,6 +663,10 @@ impl StageOut {
         self.s_ref.refill(batch);
     }
 
+    fn wake_producers(&self) {
+        let _ = self.s_ref.n_ref_w.notify();
+    }
+
     fn drain(&mut self, guard: &mut MutexGuard<'_, Current>) -> Vec<BoxedWBatch> {
         let mut batches = vec![];
         // Empty the ring buffer
@@ -678,6 +688,9 @@ pub(crate) struct TransmissionPipelineConf {
     pub(crate) wait_before_drop: Duration,
     pub(crate) max_wait_before_drop_fragments: Duration,
     pub(crate) wait_before_close: Duration,
+    /// Refuse every message once a blocking one could not be pushed within
+    /// `wait_before_close`, for transports that close themselves on that failure.
+    pub(crate) refuse_after_block_failure: bool,
     pub(crate) batching_enabled: bool,
     pub(crate) batching_time_limit: Duration,
     pub(crate) queue_alloc: QueueAllocConf,
@@ -694,6 +707,7 @@ impl TransmissionPipeline {
     ) -> (TransmissionPipelineProducer, TransmissionPipelineConsumer) {
         let status = Arc::new(TransmissionPipelineStatus {
             disabled: AtomicBool::new(false),
+            refuse_after_block_failure: config.refuse_after_block_failure,
             congested: AtomicU8::new(0),
             pending: AtomicU8::new(0),
             waits: Waits {
@@ -808,6 +822,8 @@ impl TransmissionPipeline {
 struct TransmissionPipelineStatus {
     // The whole pipeline is enabled or disabled
     disabled: AtomicBool,
+    // Disable the pipeline when a blocking message could not be pushed
+    refuse_after_block_failure: bool,
     // Bitflags to indicate the given priority queue is congested
     congested: AtomicU8,
     // Bitflags to indicate the given priority queue has messages waiting to be sent
@@ -819,11 +835,11 @@ struct TransmissionPipelineStatus {
 
 impl TransmissionPipelineStatus {
     fn set_disabled(&self, status: bool) {
-        self.disabled.store(status, Ordering::Relaxed);
+        self.disabled.store(status, Ordering::Release);
     }
 
     fn is_disabled(&self) -> bool {
-        self.disabled.load(Ordering::Relaxed)
+        self.disabled.load(Ordering::Acquire)
     }
 
     fn set_congested(&self, priority: Priority, status: bool) {
@@ -903,7 +919,11 @@ impl TransmissionPipelineProducer {
         let mut deadline = Deadline::new(wait_time, max_wait_time);
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[idx]);
-        // Check again for congestion in case it happens when blocking on the mutex.
+        // Check again for a disabled pipeline or congestion, in case it happened while
+        // blocking on the mutex.
+        if self.status.is_disabled() {
+            return Err(TransportClosed);
+        }
         if msg.is_droppable() && self.status.is_congested(priority) {
             return Ok(false);
         }
@@ -921,6 +941,12 @@ impl TransmissionPipelineProducer {
             // after this point.
             if sent {
                 self.status.set_congested(priority, false);
+            } else if !msg.is_droppable() && self.status.refuse_after_block_failure {
+                // A blocking message waited `wait_before_close` in vain and the transport gets
+                // closed. Refuse further messages right away instead of letting each of them
+                // wait `wait_before_close` again while holding this queue's lock. Disabling
+                // here, with the lock still held, keeps the next waiter from starting a wait.
+                self.status.set_disabled(true);
             }
             // There is one edge case that is fortunately supported: if the message that
             // has been pushed again is fragmented, we might have some batches actually
@@ -940,6 +966,9 @@ impl TransmissionPipelineProducer {
         } else {
             0
         };
+        if self.status.is_disabled() {
+            return false;
+        }
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[priority]);
         queue.push_transport_message(msg)
@@ -1023,6 +1052,10 @@ pub(crate) trait PipelineConsumer {
         None
     }
     fn refill(&mut self, batch: BoxedWBatch, priority: Priority);
+    /// Disables the pipeline and wakes up the producers waiting for a free batch, so that
+    /// they give up instead of holding their queue's lock until their deadline. Call it
+    /// before [`drain`](Self::drain) when the consumer stops pulling.
+    fn disable_producers(&mut self);
     fn drain(&mut self) -> Vec<(BoxedWBatch, Priority)>;
 }
 
@@ -1052,6 +1085,13 @@ impl PipelineConsumer for TransmissionPipelineConsumer {
         if !batch.is_ephemeral() {
             self.stage_out[priority as usize].refill(batch);
             self.status.set_congested(priority, false);
+        }
+    }
+
+    fn disable_producers(&mut self) {
+        self.status.set_disabled(true);
+        for s_out in self.stage_out.iter() {
+            s_out.wake_producers();
         }
     }
 
@@ -1133,6 +1173,11 @@ impl PipelineConsumer for SplitTransmissionPipelineConsumer {
         }
     }
 
+    fn disable_producers(&mut self) {
+        self.status.set_disabled(true);
+        self.stage_out.wake_producers();
+    }
+
     fn drain(&mut self) -> Vec<(BoxedWBatch, Priority)> {
         let current = self.stage_out.s_in.current.clone();
         let batches = self.stage_out.drain(&mut current.lock().unwrap());
@@ -1179,6 +1224,7 @@ mod tests {
         wait_before_drop: Duration::from_millis(1),
         max_wait_before_drop_fragments: Duration::from_millis(1024),
         wait_before_close: Duration::from_secs(5),
+        refuse_after_block_failure: false,
         batching_time_limit: Duration::from_micros(1),
         queue_alloc: QueueAllocConf {
             mode: QueueAllocMode::Init,
@@ -1197,6 +1243,7 @@ mod tests {
         wait_before_drop: Duration::from_millis(1),
         max_wait_before_drop_fragments: Duration::from_millis(1024),
         wait_before_close: Duration::from_secs(5),
+        refuse_after_block_failure: false,
         batching_time_limit: Duration::from_micros(1),
         queue_alloc: QueueAllocConf {
             mode: QueueAllocMode::Init,
@@ -1541,6 +1588,82 @@ mod tests {
             assert!(producer.push_network_message(message.as_ref()).is_err());
         }
 
+        Ok(())
+    }
+
+    fn blocking_message() -> NetworkMessage {
+        NetworkMessage::from(Push {
+            wire_expr: "test".into(),
+            ext_qos: ext::QoSType::new(Priority::Control, CongestionControl::Block, true),
+            ..Push::from(vec![42u8])
+        })
+    }
+
+    #[test]
+    fn tx_pipeline_refuses_pushes_after_a_blocking_push_failed() -> ZResult<()> {
+        let wait_before_close = Duration::from_millis(500);
+        let config = TransmissionPipelineConf {
+            wait_before_close,
+            refuse_after_block_failure: true,
+            ..CONFIG_NOT_STREAMED
+        };
+        let tct = TransportPriorityTx::make(Bits::from(TransportSn::MAX))?;
+        // The consumer is kept but never pulls, like a link whose peer stopped reading.
+        let (producer, _consumer) = TransmissionPipeline::make(config, &[tct], false);
+        let message = blocking_message();
+
+        // Takes the only batch.
+        assert!(producer.push_network_message(message.as_ref()).unwrap());
+        // Waits `wait_before_close` for a batch, in vain: the transport gets closed.
+        assert!(!producer.push_network_message(message.as_ref()).unwrap());
+        // Every further message is refused at once instead of waiting `wait_before_close` again.
+        let start = Instant::now();
+        assert!(producer.push_network_message(message.as_ref()).is_err());
+        assert!(start.elapsed() < wait_before_close / 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tx_pipeline_disable_producers_releases_a_waiting_push() -> ZResult<()> {
+        for link_supports_priority in [false, true] {
+            // wait_before_close is far longer than the test timeouts below.
+            let config = TransmissionPipelineConf {
+                wait_before_close: TIMEOUT,
+                ..CONFIG_NOT_STREAMED
+            };
+            let tct = TransportPriorityTx::make(Bits::from(TransportSn::MAX))?;
+            let (producer, consumer) =
+                TransmissionPipeline::make(config, &[tct], link_supports_priority);
+            let consumer: Box<dyn FnOnce() -> usize + Send> = if link_supports_priority {
+                let mut splits = consumer.split();
+                Box::new(move || {
+                    splits.iter_mut().for_each(|c| c.disable_producers());
+                    splits.iter_mut().map(|c| c.drain().len()).sum()
+                })
+            } else {
+                let mut consumer = consumer;
+                Box::new(move || {
+                    consumer.disable_producers();
+                    consumer.drain().len()
+                })
+            };
+            let message = blocking_message();
+            assert!(producer.push_network_message(message.as_ref()).unwrap());
+
+            // This push waits for a batch that the consumer never refills.
+            let c_producer = producer.clone();
+            let waiting = task::spawn_blocking(move || {
+                c_producer.push_network_message(blocking_message().as_ref())
+            });
+            tokio::time::sleep(SLEEP).await;
+            assert!(!waiting.is_finished());
+
+            // The consumer stops, as the TX task does when its link gets closed: the waiting
+            // push gives up and drain() gets the queue's locks without waiting for it.
+            let drained = timeout(Duration::from_secs(5), task::spawn_blocking(consumer)).await??;
+            assert_eq!(drained, 1);
+            assert!(timeout(Duration::from_secs(5), waiting).await??.is_err());
+        }
         Ok(())
     }
 }
