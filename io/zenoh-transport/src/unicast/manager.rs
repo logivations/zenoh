@@ -347,6 +347,49 @@ impl Default for TransportManagerBuilderUnicast {
 /*************************************/
 /*         TRANSPORT MANAGER         */
 /*************************************/
+
+/// Closes a transport if dropped while armed.
+///
+/// Transport initialisation runs under the accept/open timeout. If that future is dropped
+/// (deadline elapsed) after the link's TX task was started but before its RX task is, the
+/// transport is left half-open forever: its TX keep-alives keep the peer's lease alive while
+/// nothing ever reads the link (the RX task, which also owns the lease watchdog, never runs).
+/// Closing it lets the peer re-establish the session instead.
+struct CloseIfCancelled(Option<Arc<dyn TransportUnicastTrait>>);
+
+impl CloseIfCancelled {
+    fn arm(transport: &Arc<dyn TransportUnicastTrait>) -> Self {
+        Self(Some(transport.clone()))
+    }
+
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CloseIfCancelled {
+    fn drop(&mut self) {
+        if let Some(transport) = self.0.take() {
+            let zid = transport.get_zid();
+            tracing::warn!(
+                "Initialisation of the transport with {zid} was cancelled before its RX task \
+                 was started: closing it"
+            );
+            // `Drop` is synchronous, so the close must be spawned; it cannot be awaited here
+            // anyway, as the caller may still hold the transport's status lock (add_link
+            // guard), which is released right after this guard is dropped.
+            zenoh_runtime::ZRuntime::Net.spawn(async move {
+                if let Err(e) = transport.close(close::reason::GENERIC).await {
+                    tracing::warn!(
+                        "Failed to close the transport with {zid} whose initialisation was \
+                         cancelled: {e}"
+                    );
+                }
+            });
+        }
+    }
+}
+
 impl TransportManager {
     pub fn config_unicast() -> TransportManagerBuilderUnicast {
         TransportManagerBuilderUnicast::default()
@@ -535,11 +578,12 @@ impl TransportManager {
         start_tx();
 
         // notify transport's callback interface that there is a new link
-        Self::notify_new_link_unicast(&transport, c_link)
-            .await
-            .map_err(|e| {
-                InitTransportError::Transport((e, transport.clone(), close::reason::GENERIC))
-            })?;
+        let cancel_guard = CloseIfCancelled::arm(&transport);
+        let notified = Self::notify_new_link_unicast(&transport, c_link).await;
+        cancel_guard.disarm();
+        notified.map_err(|e| {
+            InitTransportError::Transport((e, transport.clone(), close::reason::GENERIC))
+        })?;
 
         start_rx();
 
@@ -744,10 +788,10 @@ impl TransportManager {
         );
 
         // Notify transport's callback interface that there is a new link
-        transport_error!(
-            Self::notify_new_link_unicast(&t, c_link).await,
-            close::reason::GENERIC
-        );
+        let cancel_guard = CloseIfCancelled::arm(&t);
+        let notified = Self::notify_new_link_unicast(&t, c_link).await;
+        cancel_guard.disarm();
+        transport_error!(notified, close::reason::GENERIC);
 
         start_rx();
 
@@ -924,15 +968,29 @@ impl TransportManager {
             .collect()
     }
 
-    pub(super) async fn del_transport_unicast(&self, peer: &ZenohIdProto) -> ZResult<()> {
-        zasynclock!(self.state.unicast.transports)
-            .remove(peer)
-            .ok_or_else(|| {
+    /// Removes `transport` from the established transports map.
+    ///
+    /// The entry under the peer's zid is removed only if it is this very transport: a late
+    /// `delete()` of an already closed transport (e.g. one of several concurrent closes of the
+    /// same transport) must not remove a transport that the same peer has re-established in
+    /// the meantime.
+    pub(super) async fn del_transport_unicast(
+        &self,
+        transport: &dyn TransportUnicastTrait,
+    ) -> ZResult<()> {
+        let peer = transport.get_zid();
+        let mut guard = zasynclock!(self.state.unicast.transports);
+        match guard.get(&peer) {
+            Some(entry) if Arc::ptr_eq(entry.get_status_mutex(), transport.get_status_mutex()) => {
+                guard.remove(&peer);
+                Ok(())
+            }
+            _ => {
                 let e = zerror!("Can not delete the transport of peer: {}", peer);
                 tracing::trace!("{}", e);
-                e
-            })?;
-        Ok(())
+                Err(e.into())
+            }
+        }
     }
 
     pub(crate) async fn handle_new_link_unicast(&self, link: LinkUnicast) {
@@ -956,17 +1014,36 @@ impl TransportManager {
         let c_manager = self.clone();
         self.task_controller
             .spawn_with_rt(zenoh_runtime::ZRuntime::Acceptor, async move {
-                if tokio::time::timeout(
+                // accept_link takes the link by value. On an early handshake
+                // error (for example a malformed InitSyn) it returns before the
+                // FSM's graceful close runs, and on a timeout its future is
+                // dropped without closing at all. In both cases the socket is
+                // left open and lingers in CLOSE-WAIT, so keep a handle and
+                // close it on the failure paths, the same way the
+                // accept_pending branch above does. On success the established
+                // transport keeps its own handle to the link, so dropping this
+                // one is enough. Closing only runs after the timeout has
+                // returned, i.e. after accept_link's future is gone, so there
+                // is no concurrent access to the link.
+                let close_link = link.clone();
+                match tokio::time::timeout(
                     c_manager.config.unicast.accept_timeout,
                     super::establishment::accept::accept_link(link, &c_manager),
                 )
                 .await
-                .is_err()
                 {
-                    tracing::debug!(
-                        "Failed to accept link before deadline ({}ms)",
-                        c_manager.config.unicast.accept_timeout.as_millis()
-                    );
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::debug!("Failed to accept link: {}", e);
+                        let _ = close_link.close().await;
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            "Failed to accept link before deadline ({}ms)",
+                            c_manager.config.unicast.accept_timeout.as_millis()
+                        );
+                        let _ = close_link.close().await;
+                    }
                 }
                 incoming_counter.fetch_sub(1, SeqCst);
             });
