@@ -20,7 +20,7 @@ pub use demux::*;
 pub use mux::*;
 use zenoh_protocol::{
     core::Reliability,
-    network::{interest::Interest, Declare, Push, Request, Response, ResponseFinal},
+    network::{interest::Interest, Declare, Push, Request, RequestId, Response, ResponseFinal},
 };
 
 use super::routing::RoutingContext;
@@ -42,6 +42,9 @@ pub trait Primitives: Send + Sync {
     fn send_response(&self, msg: &mut Response);
 
     fn send_response_final(&self, msg: &mut ResponseFinal);
+
+    /// Release local query routing state without sending a response.
+    fn discard_query(&self, _qid: RequestId) {}
 
     fn send_close(&self);
 

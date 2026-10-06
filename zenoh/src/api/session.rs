@@ -3008,6 +3008,7 @@ impl Session {
             .and_then(|ts| TimestampStack::try_from(ts).ok());
 
         let query_inner = Arc::new(QueryInner {
+            discarded: false.into(),
             key_expr: key_expr.clone().into_owned(),
             parameters: parameters.to_owned().into(),
             qid,

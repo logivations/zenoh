@@ -22,7 +22,8 @@ use zenoh_keyexpr::{keyexpr, OwnedNonWildKeyExpr};
 use zenoh_protocol::{
     core::{WireExpr, EMPTY_EXPR_ID},
     network::{
-        interest::InterestMode, DeclareBody, Mapping, Push, Request, Response, ResponseFinal,
+        interest::InterestMode, DeclareBody, Mapping, Push, Request, RequestId, Response,
+        ResponseFinal,
     },
 };
 
@@ -115,6 +116,10 @@ impl Primitives for Namespace {
 
     fn send_response_final(&self, msg: &mut ResponseFinal) {
         self.primitives.send_response_final(msg);
+    }
+
+    fn discard_query(&self, qid: RequestId) {
+        self.primitives.discard_query(qid);
     }
 
     fn send_close(&self) {
