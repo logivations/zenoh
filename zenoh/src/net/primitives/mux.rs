@@ -175,6 +175,20 @@ impl EPrimitives for Mux {
             && self.handler.schedule(msg).unwrap_or(false)
     }
 
+    fn try_send_declare(&self, ctx: RoutingContext<&mut Declare>) -> bool {
+        let mut msg = NetworkMessageMut {
+            body: NetworkBodyMut::Declare(ctx.msg),
+            reliability: Reliability::Reliable,
+        };
+        let mut ctx = RoutingContext {
+            msg: (),
+            full_expr: ctx.full_expr,
+        };
+
+        self.interceptor.load().intercept(&mut msg, &mut ctx)
+            && self.handler.try_schedule(msg).unwrap_or(false)
+    }
+
     fn send_push(&self, msg: &mut Push, reliability: Reliability) -> bool {
         let msg = NetworkMessageMut {
             body: NetworkBodyMut::Push(msg),

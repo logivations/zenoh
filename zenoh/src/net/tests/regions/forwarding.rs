@@ -2148,3 +2148,68 @@ fn test_complete_queryable_failover() {
     assert_eq!(r0_r1.a2b.recorder().requests().len(), 1);
     assert_eq!(r0_r2.a2b.recorder().requests().len(), 1);
 }
+
+/// br.cs 2026-10-09: `decl_key` declared a key expression mapping to a peer with a
+/// blocking push under the routing tables lock, and a peer whose queue was full froze the
+/// whole router. A face whose queue is busy must get the declaration with the full key
+/// expression and no mapping, while a face with room gets the mapping as before.
+#[test]
+fn test_keyexpr_mapping_not_declared_to_a_busy_face() {
+    try_init_tracing_subscriber();
+
+    const S1: Region = Region::South {
+        id: 0,
+        mode: WhatAmI::Client,
+    };
+
+    const S2: Region = Region::South {
+        id: 1,
+        mode: WhatAmI::Client,
+    };
+
+    let g = HarnessBuilder::new()
+        .mode(WhatAmI::default())
+        .subregions([S1, S2])
+        .build();
+
+    let publisher = g.new_face(FaceDef::default().mode(WhatAmI::Client).region(S1));
+    let busy = g.new_face(FaceDef::default().mode(WhatAmI::Client).region(S2));
+    let idle = g.new_face(FaceDef::default().mode(WhatAmI::Client).region(S2));
+    busy.set_queue_busy(true);
+
+    // Both ask for tokens and key expression declarations, so the router maps keys to them.
+    for face in [&busy, &idle] {
+        face.interest(
+            1,
+            InterestMode::Future,
+            InterestOptions::TOKENS + InterestOptions::KEYEXPRS,
+            "k/**",
+        );
+    }
+    let keyexpr_declarations = |face: &super::MockFace| {
+        face.recorder().with_messages(|msgs| {
+            msgs.iter()
+                .filter(|m| {
+                    matches!(m, super::Message::Declare(d)
+                        if matches!(d.body, zenoh_protocol::network::DeclareBody::DeclareKeyExpr(_)))
+                })
+                .count()
+        })
+    };
+
+    // Propagating the token maps its key expression for each interested face.
+    publisher.declare_token(None, 1, "k/a");
+
+    assert_eq!(keyexpr_declarations(&idle), 1);
+    let tokens = idle.recorder().tokens();
+    assert_eq!(tokens.len(), 1);
+    assert_ne!(
+        tokens[0].wire_expr.scope, 0,
+        "a face with room gets the mapping"
+    );
+
+    assert_eq!(keyexpr_declarations(&busy), 0);
+    let tokens = busy.recorder().tokens();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].wire_expr, WireExpr::from("k/a"));
+}

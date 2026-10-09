@@ -143,6 +143,14 @@ impl TransportUnicast {
         transport.schedule(message)
     }
 
+    /// Like [`Self::schedule`], but returns `Ok(false)` instead of waiting for a congested
+    /// queue, and does not close the transport in that case. For small messages only.
+    #[inline(always)]
+    pub fn try_schedule(&self, message: NetworkMessageMut) -> ZResult<bool> {
+        let transport = self.get_inner()?;
+        transport.try_schedule(message)
+    }
+
     #[inline(always)]
     pub async fn close(&self) -> ZResult<()> {
         // Return Ok if the transport has already been closed

@@ -16,7 +16,7 @@ use std::{
     ops::Add,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, TryLockError,
     },
     time::{Duration, Instant},
 };
@@ -961,6 +961,44 @@ impl TransmissionPipelineProducer {
         Ok(sent)
     }
 
+    /// Pushes `msg` only if that is possible right away.
+    ///
+    /// Contrary to [`Self::push_network_message`], this never waits: neither for the
+    /// priority queue's lock (held by another producer, possibly blocked on a full queue)
+    /// nor for a free batch. It returns `Ok(false)` if it would have to wait; the message
+    /// is then not sent and the pipeline's congestion state is left untouched, so the
+    /// caller decides what to do instead (nothing gets closed).
+    ///
+    /// Meant for small messages sent while holding locks that other threads need, such as
+    /// the routing tables. A message that needs fragmentation may be cut short when the
+    /// batches run out, so callers must only use it for messages that fit in a batch.
+    pub(crate) fn try_push_network_message(
+        &self,
+        msg: NetworkMessageRef,
+    ) -> Result<bool, TransportClosed> {
+        if self.status.is_disabled() {
+            return Err(TransportClosed);
+        }
+        // If the queue is not QoS, it means that we only have one priority with index 0.
+        let (idx, priority) = if self.stage_in.len() > 1 {
+            let priority = msg.priority();
+            (priority as usize, priority)
+        } else {
+            (0, Priority::DEFAULT)
+        };
+        let mut queue = match self.stage_in[idx].try_lock() {
+            Ok(queue) => queue,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => return Err(TransportClosed),
+        };
+        if self.status.is_disabled() {
+            return Err(TransportClosed);
+        }
+        // A zero wait time makes the deadline immediate: no waiting for a free batch.
+        let mut deadline = Deadline::new(Duration::ZERO, None);
+        queue.push_network_message(msg, priority, &mut deadline)
+    }
+
     #[inline]
     pub(crate) fn push_transport_message(&self, msg: TransportMessage, priority: Priority) -> bool {
         // If the queue is not QoS, it means that we only have one priority with index 0.
@@ -1623,6 +1661,43 @@ mod tests {
         let start = Instant::now();
         assert!(producer.push_network_message(message.as_ref()).is_err());
         assert!(start.elapsed() < wait_before_close / 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tx_pipeline_try_push_does_not_wait_behind_a_blocked_push() -> ZResult<()> {
+        // br.cs 2026-10-09: a thread blocked on a full queue holds that queue's lock for
+        // `wait_before_close`; a declaration pushed to the same peer under the routing
+        // tables lock waited for it and stalled the whole router.
+        let wait_before_close = Duration::from_secs(1);
+        let config = TransmissionPipelineConf {
+            wait_before_close,
+            ..CONFIG_NOT_STREAMED
+        };
+        let tct = TransportPriorityTx::make(Bits::from(TransportSn::MAX))?;
+        // The consumer is kept but never pulls, like a link whose peer stopped reading.
+        let (producer, _consumer) = TransmissionPipeline::make(config, &[tct], false);
+
+        // A free batch: pushed right away.
+        assert!(producer.try_push_network_message(blocking_message().as_ref())?);
+        // No free batch: refused at once, and the pipeline stays usable.
+        let start = Instant::now();
+        assert!(!producer.try_push_network_message(blocking_message().as_ref())?);
+        assert!(start.elapsed() < wait_before_close / 4);
+
+        // A blocking push waits for a batch while holding the queue's lock...
+        let c_producer = producer.clone();
+        let waiting = task::spawn_blocking(move || {
+            c_producer.push_network_message(blocking_message().as_ref())
+        });
+        tokio::time::sleep(SLEEP).await;
+        assert!(!waiting.is_finished());
+        // ...and try_push does not wait for that lock either.
+        let start = Instant::now();
+        assert!(!producer.try_push_network_message(blocking_message().as_ref())?);
+        assert!(start.elapsed() < wait_before_close / 4);
+
+        assert!(!timeout(TIMEOUT, waiting).await??.unwrap());
         Ok(())
     }
 
