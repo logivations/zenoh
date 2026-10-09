@@ -546,6 +546,15 @@ impl MockFace {
         );
     }
 
+    /// Make this face's transport refuse messages that may not wait (`try_schedule`), as
+    /// a congested queue would.
+    pub(crate) fn set_queue_busy(&self, busy: bool) {
+        self._data
+            .as_ref()
+            .expect("only faces with a mock transport have a queue")
+            .set_try_schedule_busy(busy);
+    }
+
     /// Declare a keyexpr from this face's perspective.
     pub(crate) fn declare_keyexpr(
         &self,

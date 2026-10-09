@@ -271,6 +271,13 @@ impl EPrimitives for ENamespace {
         self.handle_declare_ingress(ctx.msg) && self.primitives.send_declare(ctx)
     }
 
+    fn try_send_declare(
+        &self,
+        ctx: super::RoutingContext<&mut zenoh_protocol::network::Declare>,
+    ) -> bool {
+        self.handle_declare_ingress(ctx.msg) && self.primitives.try_send_declare(ctx)
+    }
+
     fn send_push(&self, msg: &mut Push, reliability: zenoh_protocol::core::Reliability) -> bool {
         self.handle_namespace_ingress(&mut msg.wire_expr, None)
             && self.primitives.send_push(msg, reliability)

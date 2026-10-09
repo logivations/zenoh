@@ -107,6 +107,12 @@ pub(crate) trait TransportUnicastTrait: Send + Sync {
     /// Returns if the message has successfully been sent.
     fn schedule(&self, msg: NetworkMessageMut) -> ZResult<bool>;
 
+    /// Like [`Self::schedule`], but returns `Ok(false)` instead of waiting when the message
+    /// cannot be sent right away. Transports that never wait just schedule it.
+    fn try_schedule(&self, msg: NetworkMessageMut) -> ZResult<bool> {
+        self.schedule(msg)
+    }
+
     /*************************************/
     /*            TERMINATION            */
     /*************************************/

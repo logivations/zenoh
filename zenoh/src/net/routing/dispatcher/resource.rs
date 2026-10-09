@@ -692,16 +692,13 @@ impl Resource {
                             .unwrap_or(true)
                     })
                 {
-                    let ctx = get_mut_unchecked(&mut nonwild_prefix)
-                        .face_ctxs
-                        .entry(face.id)
-                        .or_insert_with(|| Arc::new(FaceContext::new(face.clone())));
                     let expr_id = face.get_next_local_id();
-                    get_mut_unchecked(ctx).local_expr_id = Some(expr_id);
-                    get_mut_unchecked(face)
-                        .local_mappings
-                        .insert(expr_id, nonwild_prefix.clone());
-                    face.primitives.send_declare(RoutingContext::with_expr(
+                    // Callers hold the routing tables lock, so this must not wait for the
+                    // face's queue: a peer that does not drain it would stall the whole
+                    // router for up to `wait_before_close`. If the declaration cannot be
+                    // queued right away, send the full key expression instead (routes cache
+                    // it); the mapping is declared when a route to this face is computed again.
+                    if !face.primitives.try_send_declare(RoutingContext::with_expr(
                         &mut Declare {
                             interest_id: None,
                             ext_qos: declare::ext::QoSType::DECLARE,
@@ -713,7 +710,22 @@ impl Resource {
                             }),
                         },
                         nonwild_prefix.expr().to_string(),
-                    ));
+                    )) {
+                        tracing::debug!(
+                            "{} Queue busy, sending {} without a key expression mapping",
+                            face,
+                            res.expr()
+                        );
+                        return res.expr().to_string().into();
+                    }
+                    let ctx = get_mut_unchecked(&mut nonwild_prefix)
+                        .face_ctxs
+                        .entry(face.id)
+                        .or_insert_with(|| Arc::new(FaceContext::new(face.clone())));
+                    get_mut_unchecked(ctx).local_expr_id = Some(expr_id);
+                    get_mut_unchecked(face)
+                        .local_mappings
+                        .insert(expr_id, nonwild_prefix.clone());
                     face.update_interceptors_caches(&mut nonwild_prefix);
                     WireExpr {
                         scope: expr_id,

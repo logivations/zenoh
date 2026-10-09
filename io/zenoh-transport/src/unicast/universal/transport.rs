@@ -475,6 +475,10 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
         self.internal_schedule(msg)
     }
 
+    fn try_schedule(&self, msg: NetworkMessageMut) -> ZResult<bool> {
+        self.try_internal_schedule(msg)
+    }
+
     fn add_debug_fields<'a, 'b: 'a, 'c>(
         &self,
         s: &'c mut DebugStruct<'a, 'b>,

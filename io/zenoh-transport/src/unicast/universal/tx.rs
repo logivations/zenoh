@@ -16,12 +16,43 @@
 use zenoh_protocol::core::CongestionControl;
 use zenoh_protocol::{
     core::{Priority, PriorityRange, Reliability},
-    network::{NetworkMessageExt, NetworkMessageMut, NetworkMessageRef},
+    network::{
+        DeclareBody, NetworkBodyRef, NetworkMessageExt, NetworkMessageMut, NetworkMessageRef,
+    },
 };
 use zenoh_result::ZResult;
 
 use super::transport::TransportUnicastUniversal;
 use crate::unicast::transport_unicast_inner::TransportUnicastTrait;
+
+/// Pushes that wait at least this long for room in a peer's queue are logged.
+const SLOW_PUSH_WARN: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A short description of a network message for logs: its kind and key expression.
+fn describe_network_message(msg: NetworkMessageRef) -> String {
+    match msg.body {
+        NetworkBodyRef::Push(m) => format!("Push {}", m.wire_expr),
+        NetworkBodyRef::Request(m) => format!("Request {}", m.wire_expr),
+        NetworkBodyRef::Response(m) => format!("Response {}", m.wire_expr),
+        NetworkBodyRef::ResponseFinal(_) => "ResponseFinal".to_string(),
+        NetworkBodyRef::Interest(m) => match &m.wire_expr {
+            Some(we) => format!("Interest {we}"),
+            None => "Interest".to_string(),
+        },
+        NetworkBodyRef::Declare(m) => match &m.body {
+            DeclareBody::DeclareKeyExpr(d) => format!("DeclareKeyExpr {}", d.wire_expr),
+            DeclareBody::UndeclareKeyExpr(_) => "UndeclareKeyExpr".to_string(),
+            DeclareBody::DeclareSubscriber(d) => format!("DeclareSubscriber {}", d.wire_expr),
+            DeclareBody::UndeclareSubscriber(_) => "UndeclareSubscriber".to_string(),
+            DeclareBody::DeclareQueryable(d) => format!("DeclareQueryable {}", d.wire_expr),
+            DeclareBody::UndeclareQueryable(_) => "UndeclareQueryable".to_string(),
+            DeclareBody::DeclareToken(d) => format!("DeclareToken {}", d.wire_expr),
+            DeclareBody::UndeclareToken(_) => "UndeclareToken".to_string(),
+            DeclareBody::DeclareFinal(_) => "DeclareFinal".to_string(),
+        },
+        NetworkBodyRef::OAM(_) => "OAM".to_string(),
+    }
+}
 
 impl TransportUnicastUniversal {
     /// Returns the index of the best matching [`Reliability`]-[`PriorityRange`] pair.
@@ -69,6 +100,21 @@ impl TransportUnicastUniversal {
         match_.full.or(match_.partial).or(match_.any)
     }
 
+    /// The addresses of this transport's links (`peer <- local`) for logs: a peer that is
+    /// closed before it declared anything is otherwise only known by its zid.
+    fn link_addresses(&self) -> String {
+        self.links
+            .read()
+            .map(|tls| {
+                tls.get_links()
+                    .iter()
+                    .map(|tl| format!("{} <- {}", tl.link.link.get_dst(), tl.link.link.get_src()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    }
+
     fn handle_push_result(
         &self,
         msg: NetworkMessageRef,
@@ -76,9 +122,17 @@ impl TransportUnicastUniversal {
         #[cfg(feature = "stats")] stats: zenoh_stats::LinkStats,
     ) {
         if !pushed && !msg.is_droppable() {
+            // Name the peer by its link addresses too: a peer that is closed before it
+            // declared anything is otherwise only known by its zid.
             tracing::error!(
-                "Unable to push non droppable network message to {}. Closing transport!",
-                self.config.zid
+                "Unable to push non droppable network message to {}. Closing transport! \
+                 peer: {} [{}], message: {} (priority {:?}), waited: {:?}",
+                self.config.zid,
+                self.config.whatami,
+                self.link_addresses(),
+                describe_network_message(msg),
+                msg.priority(),
+                self.manager.config.wait_before_close,
             );
             // Synchronously mark the transmission pipelines of this transport as disabled
             // so that any subsequent push to this unresponsive transport fails fast with
@@ -221,7 +275,22 @@ impl TransportUnicastUniversal {
         // block for fairly long time
         drop(transport_links);
 
+        let push_start = std::time::Instant::now();
         let pushed = pipeline.push_network_message(msg)?;
+        let push_time = push_start.elapsed();
+        // A push only takes this long when this peer's queue is full. The thread waits
+        // meanwhile, and whatever locks it holds, so name the peer even when it succeeds.
+        if pushed && push_time >= SLOW_PUSH_WARN {
+            tracing::warn!(
+                "Push to {} blocked for {:?}: peer: {} [{}], message: {} (priority {:?})",
+                self.config.zid,
+                push_time,
+                self.config.whatami,
+                self.link_addresses(),
+                describe_network_message(msg),
+                msg.priority(),
+            );
+        }
 
         #[cfg(feature = "shared-memory")]
         if pushed {
@@ -236,6 +305,49 @@ impl TransportUnicastUniversal {
             #[cfg(feature = "stats")]
             stats,
         );
+        Ok(pushed)
+    }
+
+    /// Like [`Self::internal_schedule`], but returns `Ok(false)` instead of waiting when the
+    /// message cannot be pushed right away, and does not close the transport in that case.
+    /// See [`crate::common::pipeline::TransmissionPipelineProducer::try_push_network_message`].
+    pub(crate) fn try_internal_schedule(&self, msg: NetworkMessageMut) -> ZResult<bool> {
+        let transport_links = self
+            .links
+            .read()
+            .expect("reading `TransportUnicastUniversal::links` should not fail");
+
+        let Some(transport_link_index) = Self::select(
+            transport_links.get_links().iter().map(|tl| {
+                (
+                    tl.link
+                        .config
+                        .reliability
+                        .unwrap_or(Reliability::from(tl.link.link.is_reliable())),
+                    tl.link.config.priorities.clone(),
+                )
+            }),
+            Reliability::from(msg.is_reliable()),
+            msg.priority(),
+        ) else {
+            return Ok(false);
+        };
+
+        let transport_link = transport_links
+            .get_links()
+            .get(transport_link_index)
+            .expect("transport link index should be valid");
+        let pipeline = transport_link.pipeline.clone();
+        #[cfg(feature = "stats")]
+        let stats = transport_link.stats.clone();
+        drop(transport_links);
+
+        let msg = msg.as_ref();
+        let pushed = pipeline.try_push_network_message(msg)?;
+        #[cfg(feature = "stats")]
+        if pushed {
+            stats.inc_network_message(zenoh_stats::Tx, msg);
+        }
         Ok(pushed)
     }
 }

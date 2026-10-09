@@ -48,6 +48,17 @@ pub struct MockTransportUnicastInner {
     zid: ZenohIdProto,
     whatami: WhatAmI,
     on_schedule: Arc<dyn Fn(NetworkMessage) + Send + Sync>,
+    /// Makes `try_schedule` refuse messages, like a transport whose queue is congested.
+    try_schedule_busy: std::sync::atomic::AtomicBool,
+}
+
+impl MockTransportUnicastInner {
+    /// While `busy`, `try_schedule` refuses messages (as a congested queue would) and
+    /// `schedule` still delivers them.
+    pub fn set_try_schedule_busy(&self, busy: bool) {
+        self.try_schedule_busy
+            .store(busy, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl fmt::Debug for MockTransportUnicastInner {
@@ -127,6 +138,16 @@ impl TransportUnicastTrait for MockTransportUnicastInner {
         unimplemented!("MockTransportUnicastInner::add_link")
     }
 
+    fn try_schedule(&self, msg: NetworkMessageMut) -> ZResult<bool> {
+        if self
+            .try_schedule_busy
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
+        self.schedule(msg)
+    }
+
     fn schedule(&self, msg: NetworkMessageMut) -> ZResult<bool> {
         let body = match msg.body {
             NetworkBodyMut::Push(p) => NetworkBody::Push(p.clone()),
@@ -178,6 +199,7 @@ pub fn mock_transport_unicast(
         zid,
         whatami,
         on_schedule,
+        try_schedule_busy: std::sync::atomic::AtomicBool::new(false),
     });
     let erased: Arc<dyn TransportUnicastTrait> = inner.clone();
     let transport = TransportUnicast::from(&erased);

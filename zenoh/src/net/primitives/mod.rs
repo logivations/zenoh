@@ -59,6 +59,12 @@ pub(crate) trait EPrimitives: Send + Sync {
 
     fn send_declare(&self, ctx: RoutingContext<&mut Declare>) -> bool;
 
+    /// Like [`Self::send_declare`], but returns `false` instead of waiting when the
+    /// declaration cannot be sent right away. For callers holding the routing locks.
+    fn try_send_declare(&self, ctx: RoutingContext<&mut Declare>) -> bool {
+        self.send_declare(ctx)
+    }
+
     fn send_push(&self, msg: &mut Push, reliability: Reliability) -> bool;
 
     fn send_request(&self, msg: &mut Request) -> bool;
